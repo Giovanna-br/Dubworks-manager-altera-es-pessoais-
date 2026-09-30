@@ -199,7 +199,10 @@ export const modulosTreinamentoLider: ModuloTreinamento[] = [
       "O formulário de seleção deve ter título claro com o nome do projeto, descrição com prazo, link para falas teste, campo para nome do membro, contato e personagem escolhido.",
       "Também precisa ter campo de upload para o membro enviar o teste. Se o upload não estiver funcionando, o processo inteiro fica comprometido.",
       "O líder também deve criar ou adaptar um formulário de entrega. Esse formulário é usado depois da seleção, quando os dubladores oficiais enviam suas falas.",
-      "O formulário de entrega deve pedir nome do membro, personagem, parte/semana, observações e arquivo enviado.",
+      "No novo fluxo, o formulário de Entregas não precisa pedir o personagem. Ele pede nome, telefone/WhatsApp, Semana/Corte, arquivo ou link e observação. O Manager cruza telefone + semana com o Banco & Semanas para descobrir o personagem automaticamente.",
+      "O telefone pode chegar com +55, DDD, espaços, parênteses ou hífen. O sistema normaliza esses formatos. Se o membro informar apenas o número sem DDD, a vinculação automática só acontece quando houver uma única correspondência naquela semana.",
+      "Ao criar ou reabrir uma semana, o Manager atualiza automaticamente as opções de Semana/Corte no formulário de Entregas. Sem semana aberta, o formulário pode ficar temporariamente fechado.",
+      "No formulário de Seleção, os personagens continuam vindo do Banco do Projeto. Os uploads podem ser organizados por participante e renomeados no padrão [Personagem] Nome | Telefone - 01.ext.",
       "A descrição do formulário deve explicar o padrão de envio: áudio limpo, sem efeitos desnecessários, nome correto e envio dentro do prazo.",
       "Antes de divulgar qualquer formulário, o líder precisa testar como se fosse um membro. Isso evita problema de permissão, campo obrigatório faltando ou upload bloqueado.",
       "Depois que os arquivos chegarem, o líder deve organizar as respostas e mover/identificar os arquivos dentro da pasta correta do Drive.",
@@ -338,8 +341,40 @@ export const modulosTreinamentoLider: ModuloTreinamento[] = [
     },
   },
   {
+    id: "pratica-projetos",
+    titulo: "10. Treinamento na prática — Projetos",
+    descricao:
+      "Percorra o DubWorks Manager com um guia visual, sem personagem, entendendo o fluxo real de criação, semanas e relatórios.",
+    conteudos: [
+      "Este módulo abre um tutorial prático dentro do próprio DubWorks Manager.",
+      "O tutorial destaca os elementos reais da tela e explica o que cada área faz, sem alterar dados automaticamente.",
+      "Você verá a listagem com quatro projetos por linha, a criação com campos obrigatórios, as abas separadas do projeto, Banco & Semanas e Relatórios.",
+      "No final, você volta ao treinamento para responder a parte teórica normalmente.",
+    ],
+    checklist: [
+      "Viu a listagem de projetos",
+      "Abriu a criação de projeto",
+      "Conheceu as abas internas",
+      "Conheceu Banco & Semanas",
+      "Conheceu Relatórios",
+    ],
+    pergunta: {
+      pergunta:
+        "Qual é a finalidade do treinamento na prática?",
+      alternativas: [
+        "Alterar projetos automaticamente sem confirmação.",
+        "Guiar o usuário pelas telas reais do Manager e explicar o fluxo de trabalho.",
+        "Substituir toda a prova teórica.",
+        "Criar um projeto definitivo sem revisão.",
+      ],
+      correta: 1,
+      explicacao:
+        "O tutorial prático serve para ensinar o uso real do sistema, destacando as áreas sem executar alterações sozinho.",
+    },
+  },
+  {
     id: "prova-final",
-    titulo: "10. Prova final do líder",
+    titulo: "11. Prova final do líder",
     descricao:
       "Responder perguntas de revisão geral para concluir a parte teórica do treinamento.",
     conteudos: [
@@ -368,7 +403,7 @@ export const modulosTreinamentoLider: ModuloTreinamento[] = [
   },
   {
     id: "avaliacao",
-    titulo: "11. Avaliação final da diretoria",
+    titulo: "12. Avaliação final da diretoria",
     descricao:
       "A diretoria avalia se o líder em treinamento pode virar líder oficial.",
     conteudos: [

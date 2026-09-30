@@ -18,13 +18,43 @@ export type TrainingStatus =
   | "concluido"
   | "reprovado";
 
-export type StatusMembro = "na_comunidade" | "saiu" | "banido" | "pausado";
+export type StatusMembro =
+  | "nao_definido"
+  | "na_comunidade"
+  | "somente_canais"
+  | "saiu"
+  | "banido"
+  | "pausado";
+
+export type AtendimentoMembro =
+  | "chamar"
+  | "01"
+  | "02"
+  | "concluido"
+  | "erro";
+
+export type HistoricoMembroEvento = {
+  id?: string;
+  data: string;
+  tipo:
+    | "ficha"
+    | "atendimento"
+    | "participacao"
+    | "edicao"
+    | "observacao"
+    | "movimentacao";
+  titulo: string;
+  detalhe?: string | null;
+  valor_anterior?: string | null;
+  valor_novo?: string | null;
+  usuario?: string | null;
+  cargo?: string | null;
+};
 
 export type Usuario = {
   id?: number;
   nome: string;
   login: string;
-  senha?: string | null;
   cargo: Cargo;
   vinculo: string;
   training_status?: TrainingStatus;
@@ -134,9 +164,14 @@ export type Membro = {
   email: string;
   data_nascimento?: string | null;
   idade?: number | null;
+  faixa_etaria?: string | null;
+  idade_inconsistente?: boolean;
   habilidades?: string | null;
   motivacao?: string | null;
   status: StatusMembro;
+  atendimento?: AtendimentoMembro | string | null;
+  movimentacao?: string | null;
+  data_ficha?: string | null;
   data_entrada?: string | null;
   data_saida?: string | null;
   observacao?: string | null;
@@ -199,6 +234,7 @@ export type ProjetoSemana = {
   status: "aberta" | "concluida";
   aberta_em?: string | null;
   fechada_em?: string | null;
+  prazo_em?: string | null;
   liberada_por?: string | null;
   observacao?: string | null;
 };

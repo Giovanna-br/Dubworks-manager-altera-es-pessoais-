@@ -1,8 +1,20 @@
 import type { ChavePermissao } from "../types";
 
 export const LOGO_URL = "/Logo_dubworks.png";
-export const FORMS_COPIER_URL =
-  "https://script.google.com/macros/s/AKfycbx4bopNipOGkZk5eEGPaqLVtLYJ_exZmxCni10EflhaeTxLNEXt79OcpCT0h8m5PeYC/exec";
+// Google Forms agora é acessado sempre pelo backend (Supabase Edge Function).
+// A URL e o token do Apps Script NÃO ficam mais no frontend.
+export const FORMS_PROXY_FUNCTION_NAME = String(
+  import.meta.env.VITE_DUBWORKS_FORMS_PROXY_FUNCTION || "google-forms-proxy"
+).trim();
+
+export const FORMS_PROXY_ENABLED =
+  String(import.meta.env.VITE_DUBWORKS_FORMS_PROXY_ENABLED || "true")
+    .trim()
+    .toLowerCase() !== "false";
+
+export const DRIVE_PROXY_FUNCTION_NAME = String(
+  import.meta.env.VITE_DUBWORKS_DRIVE_PROXY_FUNCTION || "google-drive-create-structure"
+).trim();
 
 export const permissoesDisponiveis: { chave: ChavePermissao; label: string }[] = [
   { chave: "acesso_projetos", label: "Projetos" },

@@ -1,11 +1,11 @@
 {
-  "name": "dubworks-manager-refatorado",
+  "name": "dubworks-manager-2-2-test-safe-merged",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.2.0-test",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "vite --mode test",
+    "build": "tsc && vite build --mode test",
     "preview": "vite preview"
   },
   "dependencies": {

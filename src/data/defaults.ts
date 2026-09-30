@@ -11,7 +11,7 @@ export const projetoVazio: Projeto = {
   Telefone_Lider: "",
   Editor: "",
   Telefone_Editor: "",
-  Status: "Planejamento",
+  Status: "Aguardando aprovação",
   Data_Inicio: "",
   Video_Editor_Link: "",
   Registro_Semanal: "",

@@ -1,14 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
 import "../mobile-first.css";
-import CortesPage from "./CortesPage";
+const CortesPage = React.lazy(() => import("./CortesPage"));
 
 import type {
+  AtendimentoMembro,
   AvaliacaoSelecao,
   Cargo,
   ChavePermissao,
   ElencoItem,
+  DriveStructureResult,
   EntregaProducao,
+  HistoricoMembroEvento,
   Membro,
   ModuloTreinamento,
   Projeto,
@@ -26,15 +29,19 @@ import {
   LOGO_URL,
   estilos,
   permissoesDisponiveis,
+  FORMS_PROXY_ENABLED,
 } from "../config/appConfig";
 import { modulosTreinamentoLider } from "../data/trainingModules";
+import { PROJECT_STATUS_OPTIONS } from "../domain/projectStatus";
+import { useDubworksSession } from "../security/useDubworksSession";
+import { READ_ONLY_MODE, WHATSAPP_SEND_ENABLED } from "../config/runtimeConfig";
 import { elencoVazio, projetoVazio } from "../data/defaults";
 import {
   normalizar,
   cargoLabel,
   statusTreinamentoLabel,
   statusMembroLabel,
-  corStatusMembro,
+  atendimentoMembroLabel,
   statusPadraoPorCargo,
   permissaoPadraoPorCargo,
   temAcesso,
@@ -57,7 +64,11 @@ import {
   mapProjetoDb,
   mapMembroDb,
   criarEstruturaDriveViaFunction,
+  compartilharPastaDriveComUsuario,
   copiarFormulariosViaAppsScript,
+  sincronizarFormularioEntregasViaAppsScript,
+  sincronizarFormularioSelecaoViaAppsScript,
+  resolverParticipanteEntregaPorTelefone,
   extrairGoogleFileId,
   extrairGoogleFolderId,
   converterDriveParaPreview,
@@ -72,10 +83,16 @@ import {
   salvarRespostaTreinamentoBanco,
   carregarRespostasTreinamentoBanco,
   carregarUsuariosBanco,
+  criarUsuarioCompletoBanco,
   carregarMembrosBanco,
   atualizarStatusMembroBanco,
+  atualizarAtendimentoMembroBanco,
+  atualizarMembroCampoPlanilha,
+  atualizarMembroCamposPlanilha,
+  carregarHistoricoMembroPlanilha,
   buscarPerfilPorEmail,
   carregarProjetosBanco,
+  enviarCapaProjetoArquivo,
   criarProjetoBanco,
   atualizarProjetoBanco,
   atualizarArquivamentoProjetoBanco,
@@ -93,7 +110,10 @@ import {
   enfileirarLembreteWhatsapp,
   criarProximaSemanaProjetoBanco,
   fecharSemanaProjetoBanco,
+  reabrirSemanaProjetoBanco,
+  excluirSemanaProjetoBanco,
   carregarParticipantesSemanaBanco,
+  carregarAtividadeSemanalProjetosBanco,
   adicionarElencoSemanaBanco,
   removerElencoSemanaBanco,
   reabrirPapelProjetoBanco,
@@ -139,33 +159,317 @@ import {
   type ChatPreferencia,
   type NotificacaoChat,
   type ParticipanteSemanaProjeto,
+  type AtividadeSemanalProjeto,
+  type SituacaoAtividadeSemanal,
 } from "../services/appServices";
 
-const STATUS_PROJETO_OPCOES: string[] = [
-  "Aguardando início",
-  "Seleção",
-  "Em andamento",
-  "Em edição",
-  "Pausado",
-  "Stand-by",
-  "Finalizado",
+const STATUS_PROJETO_OPCOES: readonly string[] = PROJECT_STATUS_OPTIONS;
+
+
+const TIPO_PROJETO_OPCOES = ["Projeto", "Parceria"];
+
+const GENERO_PROJETO_OPCOES = [
+  "Ação",
+  "Aventura",
+  "Comédia",
+  "Drama",
+  "Fantasia",
+  "Ficção científica",
+  "Mistério",
+  "Musical",
+  "Romance",
+  "Suspense",
+  "Terror",
+  "Outro",
 ];
+
+const CATEGORIA_PROJETO_OPCOES = [
+  "Animação",
+  "Anime",
+  "Cartoon",
+  "Filme",
+  "Série",
+  "Curta-metragem",
+  "Websérie",
+  "Jogo",
+  "Áudio-drama",
+  "Outro",
+];
+
+const CATEGORIA_PROJETO_INICIO = "[[CATEGORIA_PROJETO]]";
+const CATEGORIA_PROJETO_FIM = "[[/CATEGORIA_PROJETO]]";
+const RELATORIO_PROJETO_PREFIXO = "[[RELATORIO_PROJETO]]";
+
+type StatusItemRelatorioProjeto =
+  | "entregou"
+  | "pendente"
+  | "desistiu"
+  | "saiu_projeto"
+  | "precisa_substituir"
+  | "nao_entregou"
+  | "aguardando_analise"
+  | "aprovado"
+  | "regravacao";
+
+type ItemRelatorioProjeto = {
+  personagem: string;
+  dublador: string;
+  telefone?: string;
+  status: StatusItemRelatorioProjeto;
+  observacao: string;
+};
+
+function infoStatusRelatorioAutomatico(status: StatusItemRelatorioProjeto) {
+  switch (status) {
+    case "aprovado":
+      return { label: "Aprovado", icon: "✓", color: "#86efac", bg: "rgba(22,101,52,.30)" };
+    case "aguardando_analise":
+      return { label: "Aguardando análise", icon: "⌛", color: "#fde68a", bg: "rgba(146,64,14,.30)" };
+    case "regravacao":
+      return { label: "Regravação", icon: "↻", color: "#c4b5fd", bg: "rgba(91,33,182,.28)" };
+    case "nao_entregou":
+      return { label: "Não entregou", icon: "!", color: "#fca5a5", bg: "rgba(127,29,29,.30)" };
+    case "entregou":
+      return { label: "Entregou", icon: "✓", color: "#7dd3fc", bg: "rgba(3,105,161,.26)" };
+    case "pendente":
+      return { label: "Pendente", icon: "…", color: "#fcd34d", bg: "rgba(120,53,15,.28)" };
+    case "precisa_substituir":
+      return { label: "Precisa substituir", icon: "!", color: "#fca5a5", bg: "rgba(127,29,29,.30)" };
+    case "desistiu":
+      return { label: "Desistiu", icon: "×", color: "#fca5a5", bg: "rgba(127,29,29,.30)" };
+    case "saiu_projeto":
+      return { label: "Saiu do projeto", icon: "×", color: "#fca5a5", bg: "rgba(127,29,29,.30)" };
+    default:
+      return { label: String(status).replace(/_/g, " "), icon: "•", color: "#cbd5e1", bg: "rgba(30,41,59,.7)" };
+  }
+}
+
+function infoSituacaoAtividadeSemanal(situacao: SituacaoAtividadeSemanal) {
+  switch (situacao) {
+    case "normal":
+      return { label: "Em andamento", icon: "●", color: "#86efac", bg: "rgba(22,101,52,.28)" };
+    case "aguardando_analise":
+      return { label: "Aguardando análise", icon: "⌛", color: "#fde68a", bg: "rgba(146,64,14,.28)" };
+    case "regravacao":
+      return { label: "Regravação", icon: "↻", color: "#c4b5fd", bg: "rgba(91,33,182,.28)" };
+    case "atencao":
+      return { label: "Atenção", icon: "!", color: "#fdba74", bg: "rgba(154,52,18,.28)" };
+    case "critico":
+      return { label: "Crítico", icon: "!", color: "#fca5a5", bg: "rgba(127,29,29,.32)" };
+    case "concluida":
+      return { label: "Semana concluída", icon: "✓", color: "#7dd3fc", bg: "rgba(3,105,161,.25)" };
+    case "sem_dados":
+    default:
+      return { label: "Em organização", icon: "○", color: "#cbd5e1", bg: "rgba(30,41,59,.68)" };
+  }
+}
+
+type RelatorioProjetoEstruturado = {
+  id: string;
+  tipo: "semanal" | "material";
+  projetoId: string;
+  semana?: number;
+  criadoEm: string;
+  criadoPor: string;
+  andamento?: string;
+  dificuldades?: string;
+  suporte?: string;
+  observacoes?: string;
+  itens?: ItemRelatorioProjeto[];
+  materialNome?: string;
+  materialLink?: string;
+  materialObservacao?: string;
+};
+
+type TutorialProjetoPasso = {
+  alvo: string;
+  titulo: string;
+  texto: string;
+};
+
+const TUTORIAL_PROJETO_PASSOS: TutorialProjetoPasso[] = [
+  {
+    alvo: "lista-projetos",
+    titulo: "Projetos",
+    texto: "Aqui ficam os projetos. Em telas grandes, a listagem usa quatro cards por linha.",
+  },
+  {
+    alvo: "novo-projeto",
+    titulo: "Criar um projeto",
+    texto: "Use este botão para abrir o cadastro. Os avisos de campos obrigatórios só aparecem depois da tentativa de criação.",
+  },
+  {
+    alvo: "form-novo-projeto",
+    titulo: "Preencha os dados obrigatórios",
+    texto: "Informe nome, tipo, gênero, categoria e os dados obrigatórios do líder. Editor, observações e banco inicial continuam opcionais.",
+  },
+  {
+    alvo: "abas-projeto",
+    titulo: "Áreas do projeto",
+    texto: "O projeto separa Informações, Seleção, Banco e Semanas, Registro, Atividade, Histórico e Relatórios.",
+  },
+  {
+    alvo: "semanas-projeto",
+    titulo: "Banco e Semanas",
+    texto: "Aqui você cria semanas, adiciona o elenco, conclui, reabre ou exclui uma semana quando tiver permissão.",
+  },
+  {
+    alvo: "relatorios-projeto",
+    titulo: "Relatórios integrados",
+    texto: "Crie o relatório semanal usando automaticamente o elenco da semana ou registre a entrega de material finalizado. Substituições viram pendências visíveis.",
+  },
+];
+
+function extrairCategoriaProjeto(observacoes?: string) {
+  const texto = String(observacoes || "");
+  const inicio = texto.indexOf(CATEGORIA_PROJETO_INICIO);
+  const fim = texto.indexOf(CATEGORIA_PROJETO_FIM);
+  if (inicio < 0 || fim < 0 || fim <= inicio) return "";
+  return texto
+    .slice(inicio + CATEGORIA_PROJETO_INICIO.length, fim)
+    .trim();
+}
+
+function salvarCategoriaProjeto(observacoes: string, categoria: string) {
+  const texto = String(observacoes || "");
+  const regex = /\[\[CATEGORIA_PROJETO\]\][\s\S]*?\[\[\/CATEGORIA_PROJETO\]\]/gi;
+  const semMeta = texto.replace(regex, "").trim();
+  const bloco = categoria.trim()
+    ? `${CATEGORIA_PROJETO_INICIO}${categoria.trim()}${CATEGORIA_PROJETO_FIM}`
+    : "";
+  return [semMeta, bloco].filter(Boolean).join("\n");
+}
+
+function lerRelatoriosProjeto(registro?: string): RelatorioProjetoEstruturado[] {
+  return String(registro || "")
+    .split("\n")
+    .filter((linha) => linha.startsWith(RELATORIO_PROJETO_PREFIXO))
+    .map((linha) => {
+      try {
+        return JSON.parse(
+          linha.slice(RELATORIO_PROJETO_PREFIXO.length)
+        ) as RelatorioProjetoEstruturado;
+      } catch {
+        return null;
+      }
+    })
+    .filter((item): item is RelatorioProjetoEstruturado => Boolean(item));
+}
+
+function registroSemRelatorios(registro?: string) {
+  return String(registro || "")
+    .split("\n")
+    .filter((linha) => !linha.startsWith(RELATORIO_PROJETO_PREFIXO))
+    .join("\n")
+    .trim();
+}
+
+const WHATSAPP_BRIDGE_URL = String(
+  import.meta.env.VITE_WHATSAPP_BRIDGE_URL || "http://127.0.0.1:8766"
+).trim().replace(/\/$/, "");
+const WHATSAPP_MSG_01_KEY = "dubworks_whatsapp_mensagem_01_v1";
+const WHATSAPP_MSG_02_KEY = "dubworks_whatsapp_mensagem_02_v1";
+const WHATSAPP_QUEUE_MIN_SECONDS = 15;
+const WHATSAPP_QUEUE_MAX_SECONDS = 5 * 60;
+
+const DEFAULT_WHATSAPP_MSG_01 = `Olá, tudo bem? Aqui é {responsavel}, {cargo} da DubWorks ☺️
+
+Seu número foi informado em uma de nossas fichas de inscrição. Gostaríamos apenas de confirmar:
+
+*👤 Nome na ficha:* _{nome}_
+
+_Você confirma que realizou o cadastro?_
+
+*Ficamos no aguardo da sua confirmação. Obrigado!*`;
+
+const DEFAULT_WHATSAPP_MSG_02 = `Oi, tudo bem? 😊 Meu nome é {responsavel}, faço parte da equipe da DubWorks.
+
+Estamos entrando em contato porque identificamos uma informação na sua ficha que precisa ser corrigida.
+
+*👤 Nome na ficha:* _{nome}_
+
+Pedimos, por favor, que revise e corrija a informação na sua ficha. Depois de fazer a correção, nos avise por aqui para conseguirmos dar continuidade ao seu cadastro. 💙`;
+
+type WhatsappBridgeStatus = {
+  state: string;
+  detail: string;
+  qr_data_url?: string;
+  numero?: string;
+};
+
+function lerMensagemWhatsappLocal(chave: string, padrao: string) {
+  if (typeof window === "undefined") return padrao;
+  try {
+    return window.localStorage.getItem(chave) || padrao;
+  } catch {
+    return padrao;
+  }
+}
+
+const CACHE_MEMBROS_LOCAL_KEY = "dubworks_membros_cache_v2";
+
+function lerCacheMembrosLocal(): Membro[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const bruto = window.localStorage.getItem(CACHE_MEMBROS_LOCAL_KEY);
+    if (!bruto) return [];
+    const cache = JSON.parse(bruto);
+    return Array.isArray(cache?.membros) ? cache.membros : [];
+  } catch {
+    return [];
+  }
+}
+
+function salvarCacheMembrosLocal(membros: Membro[]) {
+  if (typeof window === "undefined" || !membros.length) return;
+  try {
+    window.localStorage.setItem(
+      CACHE_MEMBROS_LOCAL_KEY,
+      JSON.stringify({ salvoEm: new Date().toISOString(), membros })
+    );
+  } catch (erro) {
+    console.warn("Não foi possível atualizar o cache local dos membros:", erro);
+  }
+}
 
 export default function DubworksManager() {
   const [projetos, setProjetos] = useState<Projeto[]>([]);
   const [usuarios, setUsuarios] = useState<Usuario[]>([]);
-  const [membros, setMembros] = useState<Membro[]>([]);
+  const [membros, setMembros] = useState<Membro[]>(() => lerCacheMembrosLocal());
   const [query, setQuery] = useState("");
   const [statusFiltro, setStatusFiltro] = useState("Todos");
-  const [usuarioLogado, setUsuarioLogado] = useState<Usuario | null>(null);
+  const [generoFiltro, setGeneroFiltro] = useState("Todos");
+  const [paginaProjetos, setPaginaProjetos] = useState(1);
+  const projetosPorPagina = 12;
+  const { usuarioLogado, setUsuarioLogado, sessaoInicialCarregada } = useDubworksSession();
   const [login, setLogin] = useState("");
   const [senha, setSenha] = useState("");
   const [erroLogin, setErroLogin] = useState("");
-  const [selecionadoId, setSelecionadoId] = useState<string | null>(null);
+  const [selecionadoId, setSelecionadoId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("projeto");
+  });
   const [rascunho, setRascunho] = useState<Projeto | null>(null);
   const [mostrarNovoProjeto, setMostrarNovoProjeto] = useState(false);
+
+  useEffect(() => {
+    const sincronizarComUrl = () => {
+      const projetoId = new URLSearchParams(window.location.search).get("projeto");
+      setSelecionadoId(projetoId);
+      setRascunho(null);
+      if (projetoId) setAbaProjeto("informacoes");
+    };
+
+    window.addEventListener("popstate", sincronizarComUrl);
+    return () => window.removeEventListener("popstate", sincronizarComUrl);
+  }, []);
   const [mostrarUsuarios, setMostrarUsuarios] = useState(false);
   const [mostrarFormNovoUsuario, setMostrarFormNovoUsuario] = useState(false);
+  const [usuarioExpandidoId, setUsuarioExpandidoId] = useState<string | null>(null);
+  const [queryUsuarios, setQueryUsuarios] = useState("");
+  const [cargoFiltroUsuarios, setCargoFiltroUsuarios] = useState<"Todos" | Cargo>("Todos");
+  const [usuarioEditandoId, setUsuarioEditandoId] = useState<string | null>(null);
+  const [usuarioEdicao, setUsuarioEdicao] = useState<Usuario | null>(null);
   const [mostrarMembros, setMostrarMembros] = useState(false);
   const [mostrarAdvertencias, setMostrarAdvertencias] = useState(false);
   const [mostrarEventos, setMostrarEventos] = useState(false);
@@ -195,6 +499,15 @@ export default function DubworksManager() {
   >("inicio");
   const [mostrarCentralAjuda, setMostrarCentralAjuda] = useState(false);
   const [mostrarRelatorios, setMostrarRelatorios] = useState(false);
+  const [atividadeSemanalProjetos, setAtividadeSemanalProjetos] = useState<
+    AtividadeSemanalProjeto[]
+  >([]);
+  const [carregandoAtividadeSemanal, setCarregandoAtividadeSemanal] = useState(false);
+  const [erroAtividadeSemanal, setErroAtividadeSemanal] = useState("");
+  const [queryAtividadeSemanal, setQueryAtividadeSemanal] = useState("");
+  const [filtroAtividadeSemanal, setFiltroAtividadeSemanal] = useState<
+    "todos" | SituacaoAtividadeSemanal
+  >("todos");
   const [mostrarTreinamentos, setMostrarTreinamentos] = useState(false);
   const [moduloTreinamentoAtivo, setModuloTreinamentoAtivo] =
     useState("papel-lider");
@@ -220,24 +533,147 @@ export default function DubworksManager() {
   });
   const [mostrarArquivados, setMostrarArquivados] = useState(false);
   const [queryMembros, setQueryMembros] = useState("");
+  const [statusMembrosFiltro, setStatusMembrosFiltro] = useState<
+    "todos" | "na_comunidade" | "somente_canais" | "saiu" | "banido"
+  >("todos");
+  const [atendimentoMembrosFiltro, setAtendimentoMembrosFiltro] = useState<
+    AtendimentoMembro | "todos"
+  >("todos");
+  const [faixaEtariaMembrosFiltro, setFaixaEtariaMembrosFiltro] = useState("todos");
+  const [ordenacaoMembros, setOrdenacaoMembros] = useState<
+    "recentes" | "antigos" | "nome_az" | "nome_za"
+  >("recentes");
+  const [ultimaSincronizacaoMembros, setUltimaSincronizacaoMembros] = useState<Date | null>(null);
   const [membroSelecionadoId, setMembroSelecionadoId] = useState<number | null>(
     null
   );
+  const [membroEmEdicaoId, setMembroEmEdicaoId] = useState<number | null>(null);
+  const [rascunhoMembroEdicao, setRascunhoMembroEdicao] = useState<Partial<Membro> | null>(null);
+  const [salvandoEdicaoMembro, setSalvandoEdicaoMembro] = useState(false);
+  const [historicoMembroSelecionado, setHistoricoMembroSelecionado] = useState<
+    HistoricoMembroEvento[]
+  >([]);
+  const [carregandoHistoricoMembro, setCarregandoHistoricoMembro] =
+    useState(false);
+  const [whatsappBridge, setWhatsappBridge] = useState<WhatsappBridgeStatus>({
+    state: "desconhecido",
+    detail: "Verificando o bridge local do WhatsApp...",
+  });
+  const [carregandoWhatsappBridge, setCarregandoWhatsappBridge] = useState(false);
+  const [enviandoWhatsappMembroId, setEnviandoWhatsappMembroId] = useState<number | null>(null);
+  const [tipoMensagemWhatsapp, setTipoMensagemWhatsapp] = useState<"01" | "02">("01");
+  const [mensagemWhatsapp01, setMensagemWhatsapp01] = useState(() =>
+    lerMensagemWhatsappLocal(WHATSAPP_MSG_01_KEY, DEFAULT_WHATSAPP_MSG_01)
+  );
+  const [mensagemWhatsapp02, setMensagemWhatsapp02] = useState(() =>
+    lerMensagemWhatsappLocal(WHATSAPP_MSG_02_KEY, DEFAULT_WHATSAPP_MSG_02)
+  );
+  const [mostrarConfigMensagensWhatsapp, setMostrarConfigMensagensWhatsapp] = useState(false);
+  const [filaWhatsappAtiva, setFilaWhatsappAtiva] = useState(false);
+  const [filaWhatsappTotal, setFilaWhatsappTotal] = useState(0);
+  const [filaWhatsappProcessados, setFilaWhatsappProcessados] = useState(0);
+  const [filaWhatsappAtual, setFilaWhatsappAtual] = useState("");
+  const [filaWhatsappProximoEm, setFilaWhatsappProximoEm] = useState<number | null>(null);
+  const [filaWhatsappResumo, setFilaWhatsappResumo] = useState("");
+  const filaWhatsappCancelarRef = useRef(false);
   const [registroSemanalTexto, setRegistroSemanalTexto] = useState("");
+  const [novoProjetoCategoria, setNovoProjetoCategoria] = useState("");
+  const [tentouCriarProjeto, setTentouCriarProjeto] = useState(false);
+
+  const [tipoRelatorioProjeto, setTipoRelatorioProjeto] = useState<"semanal" | "material">("semanal");
+  const [semanaRelatorioProjeto, setSemanaRelatorioProjeto] = useState(1);
+  const [itensRelatorioProjeto, setItensRelatorioProjeto] = useState<ItemRelatorioProjeto[]>([]);
+  const [andamentoRelatorioProjeto, setAndamentoRelatorioProjeto] = useState("");
+  const [dificuldadesRelatorioProjeto, setDificuldadesRelatorioProjeto] = useState("");
+  const [suporteRelatorioProjeto, setSuporteRelatorioProjeto] = useState("");
+  const [observacoesRelatorioProjeto, setObservacoesRelatorioProjeto] = useState("");
+  const [materialNomeRelatorioProjeto, setMaterialNomeRelatorioProjeto] = useState("");
+  const [materialLinkRelatorioProjeto, setMaterialLinkRelatorioProjeto] = useState("");
+  const [materialObservacaoRelatorioProjeto, setMaterialObservacaoRelatorioProjeto] = useState("");
+  const [salvandoRelatorioProjeto, setSalvandoRelatorioProjeto] = useState(false);
+
+  const [tutorialProjetoAtivo, setTutorialProjetoAtivo] = useState(false);
+  const [tutorialProjetoPasso, setTutorialProjetoPasso] = useState(0);
+  const [tutorialProjetoRect, setTutorialProjetoRect] = useState<DOMRect | null>(null);
+
   const [abaProjeto, setAbaProjeto] = useState<
     | "informacoes"
     | "selecao"
     | "elenco"
     | "registros"
-    | "drive"
     | "atividades"
     | "historico"
+    | "relatorios"
+    | "drive"
   >("informacoes");
   const [carregando, setCarregando] = useState(true);
   const [carregandoLogin, setCarregandoLogin] = useState(false);
   const [larguraTela, setLarguraTela] = useState(
     typeof window === "undefined" ? 1200 : window.innerWidth
   );
+
+  useEffect(() => {
+    salvarCacheMembrosLocal(membros);
+  }, [membros]);
+
+  useEffect(() => {
+    if (!mostrarMembros || !usuarioLogado || !podeGerenciarMembros(usuarioLogado)) return;
+
+    void carregarStatusWhatsappBridge();
+    const timer = window.setInterval(() => {
+      void carregarStatusWhatsappBridge(false);
+    }, 5000);
+
+    return () => window.clearInterval(timer);
+  }, [mostrarMembros, usuarioLogado?.login]);
+
+  useEffect(() => {
+    if (!tutorialProjetoAtivo || typeof document === "undefined") return;
+
+    let timer = 0;
+    const atualizar = () => {
+      const passo = TUTORIAL_PROJETO_PASSOS[tutorialProjetoPasso];
+      if (!passo) return;
+      const alvo = document.querySelector(
+        `[data-tutorial-projetos="${passo.alvo}"]`
+      ) as HTMLElement | null;
+      if (!alvo) {
+        setTutorialProjetoRect(null);
+        return;
+      }
+      alvo.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+      timer = window.setTimeout(() => {
+        setTutorialProjetoRect(alvo.getBoundingClientRect());
+      }, 260);
+    };
+
+    const atraso = window.setTimeout(atualizar, 180);
+    window.addEventListener("resize", atualizar);
+    window.addEventListener("scroll", atualizar, true);
+
+    return () => {
+      window.clearTimeout(atraso);
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", atualizar);
+      window.removeEventListener("scroll", atualizar, true);
+    };
+  }, [
+    tutorialProjetoAtivo,
+    tutorialProjetoPasso,
+    mostrarNovoProjeto,
+    abaProjeto,
+    selecionadoId,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || selecionadoId) return;
+
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("projeto")) return;
+
+    url.searchParams.delete("projeto");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [selecionadoId]);
 
   const isMobile = larguraTela <= 768;
   const isTablet = larguraTela <= 1100;
@@ -330,20 +766,32 @@ export default function DubworksManager() {
   const timerFocoNotificacaoRef = useRef<number | null>(null);
 
   const [novoProjeto, setNovoProjeto] = useState<Projeto>(projetoVazio);
+  const [novoProjetoNomeLider, setNovoProjetoNomeLider] = useState("");
+  const [novoProjetoNomeEditor, setNovoProjetoNomeEditor] = useState("");
+  const [erroEmailLiderNovo, setErroEmailLiderNovo] = useState("");
+  const [erroEmailEditorNovo, setErroEmailEditorNovo] = useState("");
+  const [validandoEmailLiderNovo, setValidandoEmailLiderNovo] = useState(false);
+  const [validandoEmailEditorNovo, setValidandoEmailEditorNovo] = useState(false);
+  const [erroEmailLiderEdicao, setErroEmailLiderEdicao] = useState("");
+  const [erroEmailEditorEdicao, setErroEmailEditorEdicao] = useState("");
   const [novoUsuario, setNovoUsuario] = useState<Usuario>({
     nome: "",
     login: "",
-    senha: "",
     cargo: "lider",
     vinculo: "",
     training_status: "nao_aplicavel",
     ...permissoesPadraoUsuario("lider"),
   });
+  const [novaSenhaUsuario, setNovaSenhaUsuario] = useState("");
   const [novoElencoProjeto, setNovoElencoProjeto] =
     useState<ElencoItem>(elencoVazio);
   const [novoElencoRascunho, setNovoElencoRascunho] =
     useState<ElencoItem>(elencoVazio);
+  const [enviandoCapaNovoProjeto, setEnviandoCapaNovoProjeto] = useState(false);
+  const [enviandoCapaProjeto, setEnviandoCapaProjeto] = useState(false);
   const [criandoEstruturaDrive, setCriandoEstruturaDrive] = useState(false);
+  const [preparandoFormulariosProjeto, setPreparandoFormulariosProjeto] =
+    useState(false);
   const [respostasSelecao, setRespostasSelecao] = useState<RespostaSelecao[]>(
     []
   );
@@ -369,6 +817,7 @@ export default function DubworksManager() {
   const [semanasProjeto, setSemanasProjeto] = useState<ProjetoSemana[]>([]);
   const [semanaFiltroProducao, setSemanaFiltroProducao] = useState(1);
   const [liberandoSemana, setLiberandoSemana] = useState(false);
+  const [excluindoSemanaProjeto, setExcluindoSemanaProjeto] = useState(false);
   const [enviandoLembretesWhatsapp, setEnviandoLembretesWhatsapp] =
     useState(false);
   const [participantesSemanaProjeto, setParticipantesSemanaProjeto] = useState<
@@ -884,7 +1333,11 @@ export default function DubworksManager() {
           links.entregasProjeto || links.projeto || ""
         );
 
-        const entregasComProjeto = respostas.map((item) => ({
+        const respostasResolvidas = await resolverEntregasPorTelefoneProjeto(
+          projeto,
+          respostas
+        );
+        const entregasComProjeto = respostasResolvidas.map((item) => ({
           ...item,
           projeto_id: Number(projeto.ID),
         }));
@@ -1286,6 +1739,81 @@ export default function DubworksManager() {
     return entregas;
   }
 
+  async function listarSemanasAbertasFormulario(projeto: Projeto) {
+    const semanas = await carregarSemanasProjetoBanco(projeto.ID);
+    return semanas
+      .filter((item) => item.status === "aberta")
+      .sort((a, b) => a.semana - b.semana)
+      .map((item) => labelSemana(item.semana));
+  }
+
+  async function sincronizarFormularioEntregasProjeto(
+    projeto: Projeto,
+    semanasAbertasFornecidas?: string[]
+  ) {
+    const links = extrairLinksDrive(projeto.Observacoes);
+    if (!links.formEntregas) return false;
+
+    const semanasAbertas =
+      semanasAbertasFornecidas || (await listarSemanasAbertasFormulario(projeto));
+
+    try {
+      return await sincronizarFormularioEntregasViaAppsScript(
+        links.formEntregas,
+        semanasAbertas
+      );
+    } catch (erro) {
+      console.error("Erro ao sincronizar semanas do formulário de entregas:", erro);
+      return false;
+    }
+  }
+
+  async function resolverEntregasPorTelefoneProjeto(
+    projeto: Projeto,
+    respostas: EntregaProducao[]
+  ) {
+    const participantesPorSemana = new Map<number, ParticipanteSemanaProjeto[]>();
+
+    for (const resposta of respostas) {
+      const semanaNumero = numeroSemanaEntrega(resposta.semana);
+      if (!participantesPorSemana.has(semanaNumero)) {
+        const participantes = await carregarParticipantesSemanaBanco(
+          projeto.ID,
+          semanaNumero
+        );
+        participantesPorSemana.set(semanaNumero, participantes);
+      }
+    }
+
+    return respostas.map((resposta) => {
+      const semanaNumero = numeroSemanaEntrega(resposta.semana);
+      const participantes = participantesPorSemana.get(semanaNumero) || [];
+      const resolucao = resolverParticipanteEntregaPorTelefone(
+        resposta.telefone,
+        participantes
+      );
+
+      if (resolucao.status === "vinculado" && resolucao.participante) {
+        return {
+          ...resposta,
+          personagem: resolucao.participante.personagem,
+          dublador: resolucao.participante.dublador || resposta.dublador,
+        };
+      }
+
+      const marcador =
+        resolucao.status === "ambiguo"
+          ? `[VÍNCULO PENDENTE: ${resolucao.detalhe}]`
+          : `[VÍNCULO NÃO ENCONTRADO: ${resolucao.detalhe}]`;
+
+      return {
+        ...resposta,
+        personagem: resposta.personagem || "Não identificado",
+        comentario: [marcador, resposta.comentario].filter(Boolean).join(" "),
+      };
+    });
+  }
+
   function todosEntregaramSemana(
     participantes: ParticipanteSemanaProjeto[],
     entregas: EntregaProducao[],
@@ -1330,6 +1858,7 @@ export default function DubworksManager() {
         projeto,
         criada.semana
       );
+      await sincronizarFormularioEntregasProjeto(projeto);
       alert(`${labelSemana(criada.semana)} criada com sucesso.`);
     } finally {
       setCriandoSemanaProjeto(false);
@@ -1372,9 +1901,110 @@ export default function DubworksManager() {
       }
 
       await carregarSemanasProjeto(projeto);
+      await sincronizarFormularioEntregasProjeto(projeto);
       alert(`${labelSemana(semanaFiltroProducao)} concluída.`);
     } finally {
       setLiberandoSemana(false);
+    }
+  }
+
+  async function reabrirSemanaAtualProjeto(projeto: Projeto) {
+    const semana = semanasProjeto.find(
+      (item) => item.semana === semanaFiltroProducao
+    );
+
+    if (!semana) {
+      alert("Selecione uma semana para reabrir.");
+      return;
+    }
+
+    if (semana.status !== "concluida") {
+      alert("Esta semana já está aberta.");
+      return;
+    }
+
+    const confirmar = window.confirm(
+      `Reabrir ${labelSemana(semanaFiltroProducao)}? Os participantes preservados continuarão vinculados à semana e ela voltará a aceitar alterações.`
+    );
+
+    if (!confirmar) return;
+
+    try {
+      setLiberandoSemana(true);
+      const ok = await reabrirSemanaProjetoBanco(
+        projeto.ID,
+        semanaFiltroProducao,
+        usuarioLogado?.nome || usuarioLogado?.login || "Sistema"
+      );
+
+      if (!ok) {
+        alert("Não consegui reabrir esta semana.");
+        return;
+      }
+
+      await carregarSemanasProjeto(projeto);
+      await carregarParticipantesSemanaProjetoBancoLocal(
+        projeto,
+        semanaFiltroProducao
+      );
+      await sincronizarFormularioEntregasProjeto(projeto);
+      alert(`${labelSemana(semanaFiltroProducao)} reaberta.`);
+    } finally {
+      setLiberandoSemana(false);
+    }
+  }
+
+  async function excluirSemanaAtualProjeto(projeto: Projeto) {
+    const semana = semanasProjeto.find(
+      (item) => item.semana === semanaFiltroProducao
+    );
+
+    if (!semana || excluindoSemanaProjeto) return;
+
+    const confirmar = window.confirm(
+      `Excluir ${labelSemana(semana.semana)}? Os participantes vinculados a esta semana serão removidos. Os arquivos já enviados ao Drive não serão apagados.`
+    );
+
+    if (!confirmar) return;
+
+    try {
+      setExcluindoSemanaProjeto(true);
+      const ok = await excluirSemanaProjetoBanco(projeto.ID, semana.semana);
+
+      if (!ok) {
+        alert("Não consegui excluir esta semana.");
+        return;
+      }
+
+      const semanasAtualizadas = await carregarSemanasProjetoBanco(projeto.ID);
+      setSemanasProjeto(semanasAtualizadas);
+
+      const semanaDestino =
+        semanasAtualizadas.find((item) => item.status === "aberta") ||
+        semanasAtualizadas[semanasAtualizadas.length - 1] ||
+        null;
+
+      if (semanaDestino) {
+        setSemanaFiltroProducao(semanaDestino.semana);
+        await carregarParticipantesSemanaProjetoBancoLocal(
+          projeto,
+          semanaDestino.semana
+        );
+      } else {
+        setSemanaFiltroProducao(1);
+        setParticipantesSemanaProjeto([]);
+      }
+
+      await sincronizarFormularioEntregasProjeto(
+        projeto,
+        semanasAtualizadas
+          .filter((item) => item.status === "aberta")
+          .sort((a, b) => a.semana - b.semana)
+          .map((item) => labelSemana(item.semana))
+      );
+      alert(`${labelSemana(semana.semana)} excluída.`);
+    } finally {
+      setExcluindoSemanaProjeto(false);
     }
   }
 
@@ -1521,6 +2151,7 @@ export default function DubworksManager() {
       }
 
       await carregarSemanasProjeto(projeto);
+      await sincronizarFormularioEntregasProjeto(projeto);
       alert(`${labelSemana(semanaAtual)} concluída.`);
     } finally {
       setLiberandoSemana(false);
@@ -1547,7 +2178,11 @@ export default function DubworksManager() {
         pastaEntregas
       );
 
-      const entregasComProjeto = respostas.map((item) => ({
+      const respostasResolvidas = await resolverEntregasPorTelefoneProjeto(
+        projeto,
+        respostas
+      );
+      const entregasComProjeto = respostasResolvidas.map((item) => ({
         ...item,
         projeto_id: Number(projeto.ID),
       }));
@@ -2452,85 +3087,75 @@ export default function DubworksManager() {
     }
   }
 
-  async function recarregarMembros() {
+  async function recarregarMembros(forcarAtualizacao = false) {
     if (!podeGerenciarMembros(usuarioLogado)) return;
 
     try {
       const lista = await comTimeout(
-        carregarMembrosBanco(),
-        20000,
-        "A busca dos membros demorou demais."
+        carregarMembrosBanco(forcarAtualizacao),
+        30000,
+        "A sincronização dos membros demorou demais."
       );
       setMembros(lista);
+      setUltimaSincronizacaoMembros(new Date());
     } catch (err) {
       console.error("Erro ao recarregar membros:", err);
     }
   }
 
   useEffect(() => {
-    async function restaurarSessaoERecarregar() {
-      try {
-        const usuarioSalvo = localStorage.getItem("dubworks_usuario");
-        if (usuarioSalvo && !usuarioLogado) {
-          try {
-            setUsuarioLogado(JSON.parse(usuarioSalvo));
-          } catch {
-            localStorage.removeItem("dubworks_usuario");
-          }
-        }
+    if (!sessaoInicialCarregada) return;
+    void recarregarProjetos();
+    void recarregarUsuarios();
+  }, [mostrarArquivados, sessaoInicialCarregada]);
 
-        await recarregarProjetos();
-        await recarregarUsuarios();
-
-        const { data } = await supabase.auth.getSession();
-        const email = data.session?.user?.email?.trim().toLowerCase();
-
-        if (!email) {
-          return;
-        }
-
-        const perfil = await buscarPerfilPorEmail(email);
-        if (perfil) {
-          setUsuarioLogado(perfil);
-          localStorage.setItem("dubworks_usuario", JSON.stringify(perfil));
-          if (podeGerenciarMembros(perfil)) {
-            carregarMembrosBanco()
-              .then(setMembros)
-              .catch((err) => console.error("Erro ao carregar membros:", err));
-          }
-        }
-      } catch (err) {
-        console.error("Erro ao restaurar sessão:", err);
-      }
+  useEffect(() => {
+    if (!sessaoInicialCarregada || !usuarioLogado) {
+      setMembros([]);
+      return;
     }
 
-    restaurarSessaoERecarregar();
+    if (!podeGerenciarMembros(usuarioLogado)) {
+      setMembros([]);
+      return;
+    }
 
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      async (_event: any, session: any) => {
-        const email = session?.user?.email?.trim().toLowerCase();
+    carregarMembrosBanco()
+      .then((lista) => {
+        setMembros(lista);
+        setUltimaSincronizacaoMembros(new Date());
+      })
+      .catch((err) => console.error("Erro ao carregar membros:", err));
+  }, [usuarioLogado?.login, sessaoInicialCarregada]);
 
-        if (!email) {
-          return;
+  useEffect(() => {
+    if (!mostrarMembros || !podeGerenciarMembros(usuarioLogado)) return;
+
+    let cancelado = false;
+    let sincronizando = false;
+
+    const sincronizarAutomaticamente = async () => {
+      if (cancelado || sincronizando || salvandoEdicaoMembro) return;
+      sincronizando = true;
+      try {
+        const lista = await carregarMembrosBanco(true);
+        if (!cancelado) {
+          setMembros(lista);
+          setUltimaSincronizacaoMembros(new Date());
         }
-
-        const perfil = await buscarPerfilPorEmail(email);
-        if (perfil) {
-          setUsuarioLogado(perfil);
-          localStorage.setItem("dubworks_usuario", JSON.stringify(perfil));
-          if (podeGerenciarMembros(perfil)) {
-            carregarMembrosBanco()
-              .then(setMembros)
-              .catch((err) => console.error("Erro ao carregar membros:", err));
-          }
-        }
+      } catch (err) {
+        console.error("Erro na sincronização automática dos membros:", err);
+      } finally {
+        sincronizando = false;
       }
-    );
-
-    return () => {
-      listener.subscription.unsubscribe();
     };
-  }, [mostrarArquivados]);
+
+    const intervalo = window.setInterval(sincronizarAutomaticamente, 15000);
+    return () => {
+      cancelado = true;
+      window.clearInterval(intervalo);
+    };
+  }, [mostrarMembros, usuarioLogado, salvandoEdicaoMembro]);
 
   useEffect(() => {
     if (!mostrarNovoProjeto || !usuarioLogado) return;
@@ -2541,7 +3166,7 @@ export default function DubworksManager() {
     ) {
       setNovoProjeto((anterior) => ({
         ...anterior,
-        Lider: usuarioLogado.vinculo || usuarioLogado.nome,
+        Lider: usuarioLogado.login || usuarioLogado.vinculo || usuarioLogado.nome,
       }));
     }
   }, [mostrarNovoProjeto, usuarioLogado]);
@@ -2563,6 +3188,36 @@ export default function DubworksManager() {
     if (!usuarioLogado) return [];
     return projetos.filter((p) => podeVerProjeto(usuarioLogado, p));
   }, [projetos, usuarioLogado]);
+
+  const projetosAtivosRelatorio = useMemo(() => {
+    return projetosVisiveis.filter((projeto) => {
+      if (projeto.Arquivado) return false;
+      const status = normalizar(projeto.Status);
+      return !["final", "conclu", "encerr", "cancel", "interromp"].some(
+        (termo) => status.includes(termo)
+      );
+    });
+  }, [projetosVisiveis]);
+
+  async function recarregarAtividadeSemanal() {
+    if (!usuarioLogado) return;
+    try {
+      setCarregandoAtividadeSemanal(true);
+      setErroAtividadeSemanal("");
+      const dados = await carregarAtividadeSemanalProjetosBanco(
+        projetosAtivosRelatorio
+      );
+      setAtividadeSemanalProjetos(dados);
+    } catch (erro) {
+      console.error("Erro ao montar atividade semanal:", erro);
+      setErroAtividadeSemanal(
+        "Não foi possível montar a atividade semanal neste momento."
+      );
+      setAtividadeSemanalProjetos([]);
+    } finally {
+      setCarregandoAtividadeSemanal(false);
+    }
+  }
 
   function iniciaisChat(nome?: string) {
     const partes = String(nome || "U").trim().split(/\s+/).filter(Boolean);
@@ -3693,22 +4348,72 @@ export default function DubworksManager() {
     };
   }, [usuarioLogado?.login]);
 
+  function normalizarStatusProjetoUI(status?: string) {
+    const valorOriginal = String(status || "").trim();
+    const valor = normalizar(valorOriginal);
+
+    if (!valor) return "Sem status";
+    if (valor.includes("aprov")) return "Aguardando aprovação";
+    if (valor.includes("nao inici") || valor.includes("não inici") || valor.includes("aguard")) {
+      return "Aguardando início";
+    }
+    if (valor.includes("planej")) return "Planejamento";
+    if (valor.includes("selec")) return "Seleção";
+    if (valor.includes("finalizand") || valor.includes("edi") || valor.includes("revis")) {
+      return "Em edição";
+    }
+    if (valor.includes("stand") || valor.includes("paus")) return "Pausado";
+    if (valor.includes("interromp") || valor.includes("cancel")) return "Interrompido";
+    if (valor.includes("conclu") || valor.includes("encerr") || valor.includes("final")) {
+      return "Finalizado";
+    }
+    if (valor.includes("exec") || valor.includes("andamento") || valor.includes("iniciad")) {
+      return "Em andamento";
+    }
+
+    return valorOriginal;
+  }
+
   const statusUnicos = useMemo(() => {
+    const ordemStatus = [
+      "Aguardando aprovação",
+      "Aguardando início",
+      "Planejamento",
+      "Seleção",
+      "Em andamento",
+      "Em edição",
+      "Pausado",
+      "Interrompido",
+      "Finalizado",
+      "Sem status",
+    ];
+
     return Array.from(
-      new Set(projetosVisiveis.map((p) => p.Status).filter(Boolean))
-    );
+      new Set(
+        projetosVisiveis.map((p) => normalizarStatusProjetoUI(p.Status)).filter(Boolean)
+      )
+    ).sort((a, b) => {
+      const indiceA = ordemStatus.indexOf(a);
+      const indiceB = ordemStatus.indexOf(b);
+      const pesoA = indiceA === -1 ? ordemStatus.length : indiceA;
+      const pesoB = indiceB === -1 ? ordemStatus.length : indiceB;
+      return pesoA - pesoB || a.localeCompare(b, "pt-BR");
+    });
   }, [projetosVisiveis]);
 
   const filtrados = useMemo(() => {
     return projetosVisiveis.filter((p) => {
       const termo = query.toLowerCase();
+      const statusProjeto = normalizarStatusProjetoUI(p.Status);
       const camposBusca = [
         p.ID,
         p.Projeto,
         p.Tipo,
         p.Genero,
+        extrairCategoriaProjeto(p.Observacoes),
         p.Prioridade,
         p.Status,
+        statusProjeto,
         p.Lider,
         p.Editor,
         p.Dupla,
@@ -3720,10 +4425,282 @@ export default function DubworksManager() {
         .toLowerCase();
 
       const busca = camposBusca.indexOf(termo) !== -1;
-      const statusOk = statusFiltro === "Todos" || p.Status === statusFiltro;
-      return busca && statusOk;
+      const statusOk = statusFiltro === "Todos" || statusProjeto === statusFiltro;
+      const generoOk =
+        generoFiltro === "Todos" ||
+        normalizar(p.Genero || "").includes(normalizar(generoFiltro));
+      return busca && statusOk && generoOk;
     });
-  }, [projetosVisiveis, query, statusFiltro]);
+  }, [projetosVisiveis, query, statusFiltro, generoFiltro]);
+
+  const totalPaginasProjetos = Math.max(
+    1,
+    Math.ceil(filtrados.length / projetosPorPagina)
+  );
+
+  const projetosPaginados = useMemo(() => {
+    const inicio = (paginaProjetos - 1) * projetosPorPagina;
+    return filtrados.slice(inicio, inicio + projetosPorPagina);
+  }, [filtrados, paginaProjetos, projetosPorPagina]);
+
+  useEffect(() => {
+    setPaginaProjetos((paginaAtual) =>
+      Math.min(Math.max(1, paginaAtual), totalPaginasProjetos)
+    );
+  }, [totalPaginasProjetos]);
+
+  function extrairNomesResponsaveisProjeto(observacoes?: string) {
+    const texto = String(observacoes || "");
+    const match = texto.match(
+      /\[\[RESPONSAVEIS_PROJETO\]\]\s*([\s\S]*?)\s*\[\[\/RESPONSAVEIS_PROJETO\]\]/i
+    );
+
+    if (!match?.[1]) return { lider: "", editor: "" };
+
+    try {
+      const dados = JSON.parse(match[1]);
+      return {
+        lider: String(dados?.lider || "").trim(),
+        editor: String(dados?.editor || "").trim(),
+      };
+    } catch {
+      return { lider: "", editor: "" };
+    }
+  }
+
+  function salvarNomesResponsaveisProjeto(
+    observacoes: string,
+    nomeLider: string,
+    nomeEditor: string
+  ) {
+    const semMetadados = String(observacoes || "")
+      .replace(
+        /\[\[RESPONSAVEIS_PROJETO\]\][\s\S]*?\[\[\/RESPONSAVEIS_PROJETO\]\]/gi,
+        " "
+      )
+      .trim();
+
+    const metadados = `[[RESPONSAVEIS_PROJETO]]${JSON.stringify({
+      lider: String(nomeLider || "").trim(),
+      editor: String(nomeEditor || "").trim(),
+    })}[[/RESPONSAVEIS_PROJETO]]`;
+
+    return [semMetadados, metadados].filter(Boolean).join("\n");
+  }
+
+  function emailPareceValido(email?: string) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
+  }
+
+  async function localizarUsuarioPorEmailProjeto(email?: string) {
+    const emailNormalizado = normalizar(String(email || "").trim());
+    if (!emailNormalizado || !emailPareceValido(emailNormalizado)) return null;
+
+    const local = usuarios.find((usuario) =>
+      [usuario.login, usuario.vinculo]
+        .filter(Boolean)
+        .some((valor) => normalizar(String(valor || "")) === emailNormalizado)
+    );
+
+    if (local) return local;
+    return await buscarPerfilPorEmail(emailNormalizado);
+  }
+
+  async function validarEmailResponsavelNovo(tipo: "lider" | "editor") {
+    const email = tipo === "lider" ? novoProjeto.Lider : novoProjeto.Editor;
+    const setErro = tipo === "lider" ? setErroEmailLiderNovo : setErroEmailEditorNovo;
+    const setValidando =
+      tipo === "lider" ? setValidandoEmailLiderNovo : setValidandoEmailEditorNovo;
+
+    if (!String(email || "").trim()) {
+      if (tipo === "lider") setErro("E-mail do líder é obrigatório.");
+      else setErro("");
+      return null;
+    }
+
+    if (!emailPareceValido(email)) {
+      setErro("Digite um e-mail válido.");
+      return null;
+    }
+
+    try {
+      setValidando(true);
+      const perfil = await localizarUsuarioPorEmailProjeto(email);
+      if (!perfil) {
+        setErro("Este e-mail não está cadastrado nos usuários do DubWorks Manager.");
+        return null;
+      }
+
+      setErro("");
+      if (tipo === "lider" && !novoProjetoNomeLider.trim()) {
+        setNovoProjetoNomeLider(perfil.nome || "");
+      }
+      if (tipo === "editor" && !novoProjetoNomeEditor.trim()) {
+        setNovoProjetoNomeEditor(perfil.nome || "");
+      }
+      return perfil;
+    } finally {
+      setValidando(false);
+    }
+  }
+
+  function atualizarNomeResponsavelRascunho(tipo: "lider" | "editor", nome: string) {
+    if (!rascunho) return;
+    const nomesAtuais = extrairNomesResponsaveisProjeto(rascunho.Observacoes);
+    setRascunho({
+      ...rascunho,
+      Observacoes: salvarNomesResponsaveisProjeto(
+        rascunho.Observacoes || "",
+        tipo === "lider" ? nome : nomesAtuais.lider,
+        tipo === "editor" ? nome : nomesAtuais.editor
+      ),
+    });
+  }
+
+  function valorDataParaInput(valor?: string) {
+    const texto = String(valor || "").trim();
+    if (!texto) return "";
+    if (/^\d{4}-\d{2}-\d{2}$/.test(texto)) return texto;
+    const data = parseDataFlex(texto);
+    if (!data || Number.isNaN(data.getTime())) return "";
+    const ano = data.getFullYear();
+    const mes = String(data.getMonth() + 1).padStart(2, "0");
+    const dia = String(data.getDate()).padStart(2, "0");
+    return `${ano}-${mes}-${dia}`;
+  }
+
+  function separarHistoricoProjeto(texto?: string) {
+    return String(texto || "")
+      .split(/\n+(?=\[[^\]]+\]\s)/g)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function limparResumoProjeto(observacoes?: string) {
+    const texto = String(observacoes || "");
+
+    return texto
+      // Remove metadados internos usados apenas pelo sistema.
+      .replace(/\[\[RESPONSAVEIS_PROJETO\]\][\s\S]*?\[\[\/RESPONSAVEIS_PROJETO\]\]/gi, " ")
+      .replace(/\[\[CATEGORIA_PROJETO\]\][\s\S]*?\[\[\/CATEGORIA_PROJETO\]\]/gi, " ")
+      // Remove blocos técnicos antigos usados para guardar links do Drive.
+      .replace(/\[\[DRIVE_LINKS\]\]\s*\{[\s\S]*?\}\s*\[\[\/DRIVE_LINKS\]\]/gi, " ")
+      .replace(/\[DRIVE_LINKS\]\s*\{[\s\S]*?\}\s*\[\/DRIVE_LINKS\]/gi, " ")
+      // Compatibilidade com registros em que só existe uma das tags.
+      .replace(/\[\[\/?DRIVE_LINKS\]\]/gi, " ")
+      .replace(/\[\/?DRIVE_LINKS\]/gi, " ")
+      // Remove JSON legado do Drive que acabou salvo junto da observação.
+      .replace(/\{\s*"(?:pasta|selecao|projeto|finalizados|falasTeste|formSelecao|formEntregas|planilhaSelecao|planilhaEntregas)"[\s\S]*?\}/gi, " ")
+      .replace(/https?:\/\/\S+/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function calcularProgressoStatusProjeto(status?: string) {
+    const valor = normalizar(status || "");
+    if (valor.includes("final")) return 100;
+    if (valor.includes("edic") || valor.includes("revis")) return 85;
+    if (valor.includes("andamento")) return 65;
+    if (valor.includes("sele") || valor.includes("planej")) return 35;
+    if (valor.includes("aguard")) return 15;
+    if (valor.includes("paus") || valor.includes("stand")) return 50;
+    return 10;
+  }
+
+  function obterProgressoProjeto(projeto: Projeto) {
+    const elencoValido = (projeto.Elenco || []).filter(
+      (item) => Boolean(item.personagem?.trim()) || Boolean(item.dublador?.trim())
+    );
+
+    if (elencoValido.length) {
+      const concluidos = elencoValido.filter((item) => {
+        const statusEntrega = normalizar(item.status_entrega || "");
+        return ["aprov", "entreg", "conclu", "final", "feito", "ok"].some(
+          (termo) => statusEntrega.includes(termo)
+        );
+      }).length;
+
+      if (concluidos > 0) {
+        return Math.max(1, Math.min(100, Math.round((concluidos / elencoValido.length) * 100)));
+      }
+    }
+
+    return calcularProgressoStatusProjeto(projeto.Status);
+  }
+
+  function obterNumeroSemanaProjeto(projeto: Projeto) {
+    const semanasElenco = (projeto.Elenco || [])
+      .map((item) => numeroSemanaEntrega(item.semana_atual))
+      .filter((numero) => Number.isFinite(numero) && numero > 0);
+
+    if (semanasElenco.length) {
+      return Math.max(...semanasElenco);
+    }
+
+    const registros = `${projeto.Registro_Semanal || ""} ${projeto.Observacoes || ""}`;
+    const correspondencias = Array.from(registros.matchAll(/semana\s*0*(\d+)/gi));
+    if (correspondencias.length) {
+      const ultimo = correspondencias[correspondencias.length - 1]?.[1];
+      return numeroSemanaEntrega(ultimo);
+    }
+
+    return 1;
+  }
+
+  function obterNomeLiderProjeto(projeto: Projeto) {
+    const nomesSalvos = extrairNomesResponsaveisProjeto(projeto.Observacoes);
+    if (nomesSalvos.lider) return nomesSalvos.lider;
+
+    const liderNormalizado = normalizar(projeto.Lider || "");
+
+    if (!liderNormalizado) return "—";
+
+    const perfil = usuarios.find((usuario) =>
+      [usuario.login, usuario.nome, usuario.vinculo].some(
+        (valor) => Boolean(valor) && normalizar(valor || "") === liderNormalizado
+      )
+    );
+
+    return perfil?.nome || projeto.Lider || "—";
+  }
+
+  function atualizarUrlProjeto(projetoId: string | null, modo: "push" | "replace" = "push") {
+    if (typeof window === "undefined") return;
+
+    const url = new URL(window.location.href);
+
+    if (projetoId) {
+      url.searchParams.set("projeto", String(projetoId));
+    } else {
+      url.searchParams.delete("projeto");
+    }
+
+    const destino = `${url.pathname}${url.search}${url.hash}`;
+
+    if (modo === "replace") {
+      window.history.replaceState({ projetoId }, "", destino);
+    } else {
+      window.history.pushState({ projetoId }, "", destino);
+    }
+  }
+
+  function abrirPaginaProjeto(projetoId: string) {
+    setRascunho(null);
+    setErroEmailLiderEdicao("");
+    setErroEmailEditorEdicao("");
+    setSelecionadoId(projetoId);
+    setAbaProjeto("informacoes");
+    atualizarUrlProjeto(projetoId, "push");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function voltarParaListaProjetos() {
+    setSelecionadoId(null);
+    setRascunho(null);
+    setAbaProjeto("informacoes");
+    atualizarUrlProjeto(null, "push");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 
   const selecionado = useMemo(() => {
     return projetos.find((p) => p.ID === selecionadoId) || null;
@@ -3731,6 +4708,63 @@ export default function DubworksManager() {
 
 
   const projetoPainel = selecionado || null;
+
+  useEffect(() => {
+    if (!projetoPainel || abaProjeto !== "relatorios" || tipoRelatorioProjeto !== "semanal") {
+      return;
+    }
+
+    const semanaInicial = semanasProjeto.some(
+      (item) => item.semana === semanaRelatorioProjeto
+    )
+      ? semanaRelatorioProjeto
+      : semanasProjeto.find((item) => item.status === "aberta")?.semana ||
+        semanasProjeto[0]?.semana ||
+        1;
+
+    if (semanaInicial !== semanaRelatorioProjeto) {
+      setSemanaRelatorioProjeto(semanaInicial);
+      return;
+    }
+
+    void carregarItensRelatorioSemana(projetoPainel, semanaInicial);
+  }, [
+    projetoPainel?.ID,
+    abaProjeto,
+    tipoRelatorioProjeto,
+    semanaRelatorioProjeto,
+    semanasProjeto,
+    entregasProducao,
+  ]);
+
+  const resumoRelatorioAutomaticoProjeto = useMemo(() => {
+    const previstos = itensRelatorioProjeto.length;
+    const aprovados = itensRelatorioProjeto.filter((item) => item.status === "aprovado").length;
+    const pendentes = itensRelatorioProjeto.filter(
+      (item) => item.status === "aguardando_analise"
+    ).length;
+    const regravacoes = itensRelatorioProjeto.filter(
+      (item) => item.status === "regravacao"
+    ).length;
+    const naoEntregaram = itensRelatorioProjeto.filter(
+      (item) => item.status === "nao_entregou"
+    ).length;
+    const entregaram = Math.max(0, previstos - naoEntregaram);
+    return {
+      previstos,
+      entregaram,
+      naoEntregaram,
+      pendentes,
+      aprovados,
+      regravacoes,
+      progressoRecebimento: previstos
+        ? Math.round((entregaram / previstos) * 100)
+        : 0,
+      progressoAprovacao: previstos
+        ? Math.round((aprovados / previstos) * 100)
+        : 0,
+    };
+  }, [itensRelatorioProjeto]);
 
   const estatisticasCards = useMemo(() => {
     const baseProjetos = projetoPainel ? [projetoPainel] : projetosVisiveis;
@@ -4073,42 +5107,108 @@ export default function DubworksManager() {
     return [];
   }, [usuarios, usuarioLogado]);
 
+  const faixasEtariasMembros = useMemo(() => {
+    return Array.from(
+      new Set(
+        membros
+          .map((m) => String(m.faixa_etaria || "").trim())
+          .filter(Boolean)
+      )
+    ).sort((a, b) =>
+      a.localeCompare(b, "pt-BR", { numeric: true, sensitivity: "base" })
+    );
+  }, [membros]);
+
   const membrosFiltrados = useMemo(() => {
     const termo = normalizar(queryMembros);
-    if (!termo) return membros;
 
     const statusDireto: Record<string, StatusMembro> = {
       "na comunidade": "na_comunidade",
       ativo: "na_comunidade",
       ativos: "na_comunidade",
+      "so nos canais": "somente_canais",
+      "só nos canais": "somente_canais",
+      canais: "somente_canais",
       saiu: "saiu",
       sairam: "saiu",
       saíram: "saiu",
       banido: "banido",
       banidos: "banido",
-      pausado: "pausado",
-      pausados: "pausado",
     };
 
-    if (statusDireto[termo]) {
-      return membros.filter((m) => m.status === statusDireto[termo]);
-    }
+    const normalizarAtendimento = (valor?: string | null) => {
+      const atual = normalizar(String(valor || "chamar"));
+      if (atual === "1") return "01";
+      if (atual === "2") return "02";
+      if (atual === "concluido" || atual === "concluído") return "concluido";
+      if (atual === "erro") return "erro";
+      return "chamar";
+    };
 
-    return membros.filter((m) =>
-      [
+    const filtrados = membros.filter((m) => {
+      if (statusMembrosFiltro !== "todos" && m.status !== statusMembrosFiltro) {
+        return false;
+      }
+
+      if (
+        atendimentoMembrosFiltro !== "todos" &&
+        normalizarAtendimento(m.atendimento) !== atendimentoMembrosFiltro
+      ) {
+        return false;
+      }
+
+      if (
+        faixaEtariaMembrosFiltro !== "todos" &&
+        String(m.faixa_etaria || "").trim() !== faixaEtariaMembrosFiltro
+      ) {
+        return false;
+      }
+
+      if (!termo) return true;
+      if (statusDireto[termo]) return m.status === statusDireto[termo];
+
+      return [
         m.nome,
         m.telefone,
         m.email,
         m.habilidades || "",
         m.motivacao || "",
         m.observacao || "",
+        m.faixa_etaria || "",
+        atendimentoMembroLabel(m.atendimento),
         statusMembroLabel(m.status),
       ]
         .join(" ")
         .toLowerCase()
-        .includes(termo)
-    );
-  }, [membros, queryMembros]);
+        .includes(termo);
+    });
+
+    return [...filtrados].sort((a, b) => {
+      if (ordenacaoMembros === "nome_az") {
+        return String(a.nome || "").localeCompare(String(b.nome || ""), "pt-BR", {
+          sensitivity: "base",
+        });
+      }
+
+      if (ordenacaoMembros === "nome_za") {
+        return String(b.nome || "").localeCompare(String(a.nome || ""), "pt-BR", {
+          sensitivity: "base",
+        });
+      }
+
+      const dataA = parseDataFlex(a.data_entrada || a.data_ficha)?.getTime() || 0;
+      const dataB = parseDataFlex(b.data_entrada || b.data_ficha)?.getTime() || 0;
+
+      return ordenacaoMembros === "antigos" ? dataA - dataB : dataB - dataA;
+    });
+  }, [
+    membros,
+    queryMembros,
+    statusMembrosFiltro,
+    atendimentoMembrosFiltro,
+    faixaEtariaMembrosFiltro,
+    ordenacaoMembros,
+  ]);
 
   const relatorioEntradaSaida = useMemo(() => {
     return calcularRelatorioEntradaSaida(membros);
@@ -4118,6 +5218,15 @@ export default function DubworksManager() {
     (m) => m.status === "na_comunidade"
   ).length;
   const totalMembrosSaida = membros.filter((m) => m.status === "saiu").length;
+  const totalMembrosCanais = membros.filter(
+    (m) => m.status === "somente_canais"
+  ).length;
+  const totalMembrosBanidos = membros.filter(
+    (m) => m.status === "banido"
+  ).length;
+  const totalAtendimentoPendente = membros.filter(
+    (m) => String(m.atendimento || "chamar") === "chamar"
+  ).length;
 
   const totalProjetos = projetosVisiveis.length;
   const totalAtivos = projetosVisiveis.filter(
@@ -4260,9 +5369,12 @@ export default function DubworksManager() {
       }
 
       setUsuarioLogado(perfil);
-      localStorage.setItem("dubworks_usuario", JSON.stringify(perfil));
       setErroLogin("");
-      setSelecionadoId(null);
+      setSelecionadoId(
+        typeof window === "undefined"
+          ? null
+          : new URLSearchParams(window.location.search).get("projeto")
+      );
 
       // Recarrega os dados depois de liberar a entrada.
       // Assim o botão não fica preso em "Entrando..." se alguma consulta demorar.
@@ -4286,6 +5398,11 @@ export default function DubworksManager() {
   }
 
   async function enviarRecuperacaoSenha() {
+    if (READ_ONLY_MODE) {
+      setErroLogin("Modo de teste: recuperação de senha desativada para não alterar o Supabase Auth original.");
+      return;
+    }
+
     const email = login.trim().toLowerCase();
 
     if (!email) {
@@ -4310,7 +5427,6 @@ export default function DubworksManager() {
 
   async function sair() {
     await supabase.auth.signOut();
-    localStorage.removeItem("dubworks_usuario");
     setUsuarioLogado(null);
     setLogin("");
     setSenha("");
@@ -4324,34 +5440,113 @@ export default function DubworksManager() {
     setRascunho({ ...rascunho, [campo]: valor });
   }
 
+  async function enviarCapaNovoProjeto(arquivo: File | null) {
+    if (!arquivo) return;
+
+    setEnviandoCapaNovoProjeto(true);
+    try {
+      const url = await enviarCapaProjetoArquivo(arquivo);
+      if (!url) throw new Error("Não recebi a URL da capa enviada.");
+      setNovoProjeto((anterior) => ({ ...anterior, Capa_URL: url }));
+    } catch (erro) {
+      alert(erro instanceof Error ? erro.message : "Não consegui enviar a capa.");
+    } finally {
+      setEnviandoCapaNovoProjeto(false);
+    }
+  }
+
+  async function enviarCapaRascunho(arquivo: File | null) {
+    if (!arquivo || !rascunho) return;
+
+    setEnviandoCapaProjeto(true);
+    try {
+      const url = await enviarCapaProjetoArquivo(arquivo);
+      if (!url) throw new Error("Não recebi a URL da capa enviada.");
+      setRascunho((anterior) =>
+        anterior ? { ...anterior, Capa_URL: url } : anterior
+      );
+    } catch (erro) {
+      alert(erro instanceof Error ? erro.message : "Não consegui enviar a capa.");
+    } finally {
+      setEnviandoCapaProjeto(false);
+    }
+  }
+
   function limparFormularioProjeto() {
-    setNovoProjeto({
-      ...projetoVazio,
-      Lider:
-        usuarioLogado &&
+    const usuarioEhLider = Boolean(
+      usuarioLogado &&
         (usuarioLogado.cargo === "lider" ||
           usuarioLogado.cargo === "lider_treinamento")
-          ? usuarioLogado.vinculo || usuarioLogado.nome
-          : "",
+    );
+
+    const emailUsuario = usuarioEhLider
+      ? usuarioLogado?.login || usuarioLogado?.vinculo || ""
+      : "";
+    const membroUsuario = membros.find(
+      (membro) => normalizar(membro.email || "") === normalizar(emailUsuario)
+    );
+
+    setNovoProjeto({
+      ...projetoVazio,
+      Lider: emailUsuario,
+      Telefone_Lider: usuarioEhLider ? membroUsuario?.telefone || "" : "",
     });
+    setNovoProjetoNomeLider(usuarioEhLider ? usuarioLogado?.nome || "" : "");
+    setNovoProjetoNomeEditor("");
+    setNovoProjetoCategoria("");
+    setTentouCriarProjeto(false);
+    setErroEmailLiderNovo("");
+    setErroEmailEditorNovo("");
     setNovoElencoProjeto(elencoVazio);
   }
 
   async function criarProjeto() {
     if (!usuarioLogado || !podeCriarProjeto(usuarioLogado)) return;
 
-    if (!novoProjeto.Projeto.trim()) {
-      alert("Preencha pelo menos o nome do projeto.");
+    setTentouCriarProjeto(true);
+    const obrigatoriosFaltando: string[] = [];
+    if (!novoProjeto.Projeto.trim()) obrigatoriosFaltando.push("nome do projeto");
+    if (!novoProjeto.Tipo.trim()) obrigatoriosFaltando.push("tipo do projeto");
+    if (!novoProjeto.Genero.trim()) obrigatoriosFaltando.push("gênero");
+    if (!novoProjetoCategoria.trim()) obrigatoriosFaltando.push("categoria");
+    if (!novoProjetoNomeLider.trim()) obrigatoriosFaltando.push("nome do líder");
+    if (!novoProjeto.Lider.trim()) obrigatoriosFaltando.push("e-mail do líder");
+    if (!novoProjeto.Telefone_Lider.trim()) obrigatoriosFaltando.push("telefone do líder");
+
+    if (obrigatoriosFaltando.length) {
+      alert(`Preencha os campos obrigatórios: ${obrigatoriosFaltando.join(", ")}.`);
       return;
     }
 
+    const perfilLider = await validarEmailResponsavelNovo("lider");
+    if (!perfilLider) return;
+
+    let perfilEditor: Usuario | null = null;
+    if (novoProjeto.Editor.trim()) {
+      perfilEditor = await validarEmailResponsavelNovo("editor");
+      if (!perfilEditor) return;
+    }
+
+    const usuarioEhLider =
+      usuarioLogado.cargo === "lider" ||
+      usuarioLogado.cargo === "lider_treinamento";
+
     const projetoParaSalvar: Projeto = {
       ...novoProjeto,
-      Lider:
-        usuarioLogado.cargo === "lider" ||
-        usuarioLogado.cargo === "lider_treinamento"
-          ? usuarioLogado.vinculo || usuarioLogado.nome
-          : novoProjeto.Lider,
+      Status: "Aguardando aprovação",
+      Dupla: "",
+      Lider: usuarioEhLider
+        ? usuarioLogado.login || usuarioLogado.vinculo || novoProjeto.Lider
+        : novoProjeto.Lider,
+      Editor: novoProjeto.Editor,
+      Observacoes: salvarCategoriaProjeto(
+        salvarNomesResponsaveisProjeto(
+          novoProjeto.Observacoes || "",
+          novoProjetoNomeLider || perfilLider?.nome || "",
+          novoProjetoNomeEditor || perfilEditor?.nome || ""
+        ),
+        novoProjetoCategoria
+      ),
     };
 
     const projetoParaSalvarComHistorico: Projeto = {
@@ -4382,8 +5577,8 @@ export default function DubworksManager() {
     await recarregarProjetos();
     setMostrarNovoProjeto(false);
     limparFormularioProjeto();
-    setSelecionadoId(projetoId);
-    alert("Projeto salvo no banco 🚀");
+    abrirPaginaProjeto(projetoId);
+    alert("Projeto salvo. A página dedicada dele já foi criada 🚀");
   }
 
   function registrarHistoricoProjeto(texto: string) {
@@ -4399,6 +5594,104 @@ export default function DubworksManager() {
         .filter(Boolean)
         .join("\n"),
     });
+  }
+
+  async function prepararOuAtualizarFormulariosProjeto() {
+    if (!rascunho || !projetoPainel || preparandoFormulariosProjeto) return;
+
+    if (!podeEditarProjeto(usuarioLogado, projetoPainel)) {
+      alert("Você não tem permissão para preparar os formulários deste projeto.");
+      return;
+    }
+
+    const linksAtuais = extrairLinksDrive(rascunho.Observacoes);
+    const respostasSelecaoFolderId = extrairGoogleFolderId(
+      linksAtuais.respostasSelecao || linksAtuais.selecao || ""
+    );
+    const entregasFolderId = extrairGoogleFolderId(
+      linksAtuais.entregasProjeto || linksAtuais.projeto || ""
+    );
+
+    if (!respostasSelecaoFolderId || !entregasFolderId) {
+      alert(
+        "Crie primeiro a estrutura do Drive. Preciso das pastas de Seleção e Projeto para guardar os formulários e as planilhas."
+      );
+      return;
+    }
+
+    try {
+      setPreparandoFormulariosProjeto(true);
+
+      const personagens = Array.from(
+        new Set(
+          (rascunho.Elenco || [])
+            .map((item) => String(item.personagem || "").trim())
+            .filter(Boolean)
+        )
+      );
+      const semanasAbertas = await listarSemanasAbertasFormulario(projetoPainel);
+
+      const forms = await copiarFormulariosViaAppsScript(
+        rascunho.Projeto || projetoPainel.Projeto || "Projeto",
+        respostasSelecaoFolderId,
+        entregasFolderId,
+        personagens,
+        {
+          projectId: String(projetoPainel.ID || ""),
+          projectType: rascunho.Tipo || projetoPainel.Tipo || "Projeto",
+          mainFolderId: extrairGoogleFolderId(linksAtuais.pasta || ""),
+          formSelecao: linksAtuais.formSelecao || "",
+          formEntregas: linksAtuais.formEntregas || "",
+          semanasAbertas,
+        }
+      );
+
+      if (!forms.formSelecao && !forms.formEntregas) {
+        throw new Error(
+          "A integração respondeu, mas não devolveu os links dos formulários."
+        );
+      }
+
+      const novosLinks = {
+        ...linksAtuais,
+        formSelecao: forms.formSelecao || linksAtuais.formSelecao || "",
+        formEntregas: forms.formEntregas || linksAtuais.formEntregas || "",
+        planilhaSelecao:
+          forms.planilhaSelecao || linksAtuais.planilhaSelecao || "",
+        planilhaEntregas:
+          forms.planilhaEntregas || linksAtuais.planilhaEntregas || "",
+      };
+
+      const atualizado = aplicarHistoricoAutomatico(
+        projetoPainel,
+        {
+          ...rascunho,
+          Observacoes: salvarLinksDriveEmObservacoes(
+            rascunho.Observacoes,
+            novosLinks
+          ),
+        },
+        "criou/atualizou os formulários do projeto"
+      );
+
+      const ok = await atualizarProjetoBanco(atualizado);
+      if (!ok) {
+        throw new Error(
+          "Os formulários foram preparados, mas não consegui salvar os links no projeto."
+        );
+      }
+
+      setRascunho(atualizado);
+      await recarregarProjetos();
+      alert(
+        "Formulários atualizados. Seleção usa os personagens do Banco; Entregas usa telefone + Semana/Corte."
+      );
+    } catch (erro: any) {
+      console.error("Erro ao preparar formulários do projeto:", erro);
+      alert(`Erro ao preparar formulários: ${erro?.message || String(erro)}`);
+    } finally {
+      setPreparandoFormulariosProjeto(false);
+    }
   }
 
   async function criarEstruturaDriveProjeto() {
@@ -4427,8 +5720,13 @@ export default function DubworksManager() {
     try {
       setCriandoEstruturaDrive(true);
 
+      const prefixoPasta =
+        normalizar(rascunho.Tipo || projetoPainel.Tipo) === "parceria"
+          ? "[Parceria]"
+          : "[Projeto]";
+
       const resultado = await criarEstruturaDriveViaFunction(
-        `[Projeto] ${rascunho.Projeto || projetoPainel.Projeto || "Sem nome"}`,
+        `${prefixoPasta} ${rascunho.Projeto || projetoPainel.Projeto || "Sem nome"}`,
         rascunho.Lider || projetoPainel.Lider || "",
         rascunho.Editor || projetoPainel.Editor || ""
       );
@@ -4451,6 +5749,64 @@ export default function DubworksManager() {
         return;
       }
 
+      const personagensFormulario = Array.from(
+        new Set(
+          (rascunho.Elenco || [])
+            .map((item) => String(item.personagem || "").trim())
+            .filter(Boolean)
+        )
+      );
+
+      let formulariosCriados: Partial<DriveStructureResult> = {};
+      let erroPreparacaoFormularios = "";
+
+      // A função de pastas e a função dos Forms são integrações separadas.
+      // Quando os Forms ainda não vierem prontos da estrutura do Drive,
+      // criamos/copiamos os formulários já enviando a lista do Banco do Projeto.
+      if (
+        !resultado.formSelecao ||
+        !resultado.formEntregas ||
+        FORMS_PROXY_ENABLED
+      ) {
+        const respostasSelecaoFolderId =
+          resultado.respostasSelecaoId ||
+          extrairGoogleFolderId(resultado.respostasSelecao || resultado.selecao || "");
+        const entregasFolderId =
+          resultado.entregasProjetoId ||
+          extrairGoogleFolderId(resultado.entregasProjeto || resultado.projeto || "");
+
+        if (respostasSelecaoFolderId && entregasFolderId) {
+          try {
+            const semanasAbertas = await listarSemanasAbertasFormulario(
+              projetoPainel
+            );
+            formulariosCriados = await copiarFormulariosViaAppsScript(
+              rascunho.Projeto || projetoPainel.Projeto || "Projeto",
+              respostasSelecaoFolderId,
+              entregasFolderId,
+              personagensFormulario,
+              {
+                projectId: String(projetoPainel.ID || ""),
+                projectType: rascunho.Tipo || projetoPainel.Tipo || "Projeto",
+                mainFolderId:
+                  resultado.pastaId ||
+                  extrairGoogleFolderId(resultado.pasta || ""),
+                formSelecao: linksAtuais.formSelecao || "",
+                formEntregas: linksAtuais.formEntregas || "",
+                semanasAbertas,
+              }
+            );
+          } catch (erroForms: any) {
+            erroPreparacaoFormularios =
+              erroForms?.message || String(erroForms || "Erro desconhecido");
+            console.error(
+              "Estrutura criada, mas houve erro ao preparar os formulários:",
+              erroForms
+            );
+          }
+        }
+      }
+
       const novosLinks = {
         ...linksAtuais,
         pasta: resultado.pasta || linksAtuais.pasta || "",
@@ -4465,12 +5821,14 @@ export default function DubworksManager() {
         Advertencia: resultado.Advertencia,
         entregasProjeto:
           resultado.entregasProjeto || linksAtuais.entregasProjeto || "",
-        formSelecao: resultado.formSelecao || linksAtuais.formSelecao || "",
-        formEntregas: resultado.formEntregas || linksAtuais.formEntregas || "",
+        formSelecao:
+          resultado.formSelecao || formulariosCriados.formSelecao || linksAtuais.formSelecao || "",
+        formEntregas:
+          resultado.formEntregas || formulariosCriados.formEntregas || linksAtuais.formEntregas || "",
         planilhaSelecao:
-          resultado.planilhaSelecao || linksAtuais.planilhaSelecao || "",
+          resultado.planilhaSelecao || formulariosCriados.planilhaSelecao || linksAtuais.planilhaSelecao || "",
         planilhaEntregas:
-          resultado.planilhaEntregas || linksAtuais.planilhaEntregas || "",
+          resultado.planilhaEntregas || formulariosCriados.planilhaEntregas || linksAtuais.planilhaEntregas || "",
       };
 
       const projetoComLinks: Projeto = {
@@ -4498,7 +5856,13 @@ export default function DubworksManager() {
 
       setRascunho(projetoComHistorico);
       await recarregarProjetos();
-      alert("Estrutura do Drive criada e links salvos no projeto.");
+      if (erroPreparacaoFormularios) {
+        alert(
+          `Estrutura do Drive criada e salva, mas os formulários não foram preparados.\n\n${erroPreparacaoFormularios}\n\nUse o botão "Criar/atualizar formulários" para tentar novamente sem recriar as pastas.`
+        );
+      } else {
+        alert("Estrutura do Drive e formulários preparados com sucesso.");
+      }
     } catch (err: any) {
       console.error("Erro ao criar estrutura no Drive:", err);
       alert(
@@ -4588,7 +5952,6 @@ export default function DubworksManager() {
       { chave: "Data_Inicio", label: "data de início" },
       { chave: "Video_Editor_Link", label: "link do vídeo do editor" },
       { chave: "Capa_URL", label: "capa do projeto" },
-      { chave: "Observacoes", label: "observações/links do Drive" },
     ];
 
     campos.forEach((campo) => {
@@ -4599,6 +5962,22 @@ export default function DubworksManager() {
         alteracoes.push(campo.label);
       }
     });
+
+    const nomesAntes = extrairNomesResponsaveisProjeto(antes.Observacoes);
+    const nomesDepois = extrairNomesResponsaveisProjeto(depois.Observacoes);
+    if (nomesAntes.lider !== nomesDepois.lider) alteracoes.push("nome do líder");
+    if (nomesAntes.editor !== nomesDepois.editor) alteracoes.push("nome do editor");
+
+    const observacoesSemResponsaveis = (valor?: string) =>
+      String(valor || "")
+        .replace(/\[\[RESPONSAVEIS_PROJETO\]\][\s\S]*?\[\[\/RESPONSAVEIS_PROJETO\]\]/gi, "")
+        .trim();
+    if (
+      observacoesSemResponsaveis(antes.Observacoes) !==
+      observacoesSemResponsaveis(depois.Observacoes)
+    ) {
+      alteracoes.push("observações/links do Drive");
+    }
 
     const elencoAntes = (antes.Elenco || [])
       .map(
@@ -4655,6 +6034,33 @@ export default function DubworksManager() {
     const podeVideo = podeSubirVideoEditor(usuarioLogado, selecionado);
     if (!podeEditar && !podeVideo) return;
 
+    const liderAlterado = normalizar(rascunho.Lider || "") !== normalizar(selecionado.Lider || "");
+    const editorAlterado = normalizar(rascunho.Editor || "") !== normalizar(selecionado.Editor || "");
+
+    if (podeEditar && liderAlterado && rascunho.Lider.trim()) {
+      const perfilLider = await localizarUsuarioPorEmailProjeto(rascunho.Lider);
+      if (!perfilLider) {
+        setErroEmailLiderEdicao(
+          "Este e-mail não está cadastrado nos usuários do DubWorks Manager."
+        );
+        alert("O e-mail do líder precisa pertencer a um usuário cadastrado.");
+        return;
+      }
+      setErroEmailLiderEdicao("");
+    }
+
+    if (podeEditar && editorAlterado && rascunho.Editor.trim()) {
+      const perfilEditor = await localizarUsuarioPorEmailProjeto(rascunho.Editor);
+      if (!perfilEditor) {
+        setErroEmailEditorEdicao(
+          "Este e-mail não está cadastrado nos usuários do DubWorks Manager."
+        );
+        alert("O e-mail do editor precisa pertencer a um usuário cadastrado.");
+        return;
+      }
+      setErroEmailEditorEdicao("");
+    }
+
     if (!podeEditar && podeVideo) {
       const projetoVideoBase: Projeto = {
         ...selecionado,
@@ -4683,7 +6089,7 @@ export default function DubworksManager() {
       Lider:
         usuarioLogado.cargo === "lider" ||
         usuarioLogado.cargo === "lider_treinamento"
-          ? usuarioLogado.vinculo || usuarioLogado.nome
+          ? usuarioLogado.login || usuarioLogado.vinculo || usuarioLogado.nome
           : rascunho.Lider,
     };
 
@@ -4709,8 +6115,33 @@ export default function DubworksManager() {
       return;
     }
 
+    let acessoDriveAtualizado = false;
+    let avisoDrive = "";
+
+    if (editorAlterado && projetoFinalComHistorico.Editor.trim()) {
+      const linksDrive = extrairLinksDrive(projetoFinalComHistorico.Observacoes || "");
+      const pastaPrincipal = linksDrive.pasta || projetoFinalComHistorico.Drive_Pasta_Link || "";
+
+      if (pastaPrincipal) {
+        try {
+          acessoDriveAtualizado = await compartilharPastaDriveComUsuario(
+            pastaPrincipal,
+            projetoFinalComHistorico.Editor
+          );
+        } catch (erro) {
+          console.error("Editor salvo, mas não foi possível atualizar o acesso ao Drive:", erro);
+          avisoDrive =
+            " O editor foi salvo no projeto, mas o acesso à pasta do Drive não pôde ser atualizado automaticamente.";
+        }
+      }
+    }
+
     await recarregarProjetos();
-    alert("Alterações salvas com sucesso.");
+    alert(
+      acessoDriveAtualizado
+        ? "Alterações salvas. O editor também recebeu acesso de edição à pasta principal do Drive."
+        : `Alterações salvas com sucesso.${avisoDrive}`
+    );
   }
 
   async function salvarElencoAtual() {
@@ -4760,6 +6191,10 @@ export default function DubworksManager() {
 
   async function criarUsuario() {
     if (!usuarioLogado || !podeGerenciarUsuarios(usuarioLogado)) return;
+    if (READ_ONLY_MODE) {
+      alert("Modo de teste: criação de usuário bloqueada para proteger o Supabase original.");
+      return;
+    }
 
     const permitidos = cargosPermitidosParaCriar(usuarioLogado);
     if (permitidos.indexOf(novoUsuario.cargo) === -1) {
@@ -4772,16 +6207,22 @@ export default function DubworksManager() {
       return;
     }
 
+    const senhaNovoUsuario = String(novaSenhaUsuario || "");
+    if (senhaNovoUsuario.length < 8) {
+      alert("Defina uma senha inicial com pelo menos 8 caracteres.");
+      return;
+    }
+
     const email = novoUsuario.login.trim().toLowerCase();
     if (usuarios.some((u) => normalizar(u.login) === email)) {
       alert("Já existe um perfil com esse login.");
       return;
     }
 
-    const payload = {
+    const perfilNovo: Usuario = {
+      ...novoUsuario,
       nome: novoUsuario.nome.trim(),
       login: email,
-      cargo: novoUsuario.cargo,
       vinculo: novoUsuario.vinculo.trim(),
       training_status:
         novoUsuario.cargo === "lider_treinamento"
@@ -4794,11 +6235,14 @@ export default function DubworksManager() {
       }, {} as Record<ChavePermissao, boolean>),
     };
 
-    const { error } = await supabase.from("usuarios").insert([payload]);
+    const resultado = await criarUsuarioCompletoBanco(
+      perfilNovo,
+      senhaNovoUsuario,
+      usuarioLogado.login
+    );
 
-    if (error) {
-      console.error("Erro ao criar perfil:", error);
-      alert("Erro ao criar perfil na tabela usuarios.");
+    if (!resultado.ok) {
+      alert(resultado.error || "Não consegui criar o usuário.");
       return;
     }
 
@@ -4807,15 +6251,17 @@ export default function DubworksManager() {
     setNovoUsuario({
       nome: "",
       login: "",
-      senha: "",
       cargo: cargoInicial,
       vinculo: "",
       training_status: statusPadraoPorCargo(cargoInicial),
       ...permissoesPadraoUsuario(cargoInicial),
     });
+    setNovaSenhaUsuario("");
 
     alert(
-      "Perfil criado com sucesso. Lembre-se: o login real também precisa existir em Authentication > Users."
+      resultado.precisaConfirmarEmail
+        ? "Usuário criado. O e-mail precisa confirmar o cadastro antes do primeiro acesso."
+        : "Usuário criado com acesso ao sistema e perfil interno configurado."
     );
   }
 
@@ -5011,10 +6457,34 @@ export default function DubworksManager() {
     chave: ChavePermissao,
     valor: boolean
   ) {
-    if (!alvo.id || !podeGerenciarUsuarios(usuarioLogado)) return;
+    if (!podeGerenciarUsuarios(usuarioLogado)) return;
 
     if (alvo.cargo === "diretoria" && usuarioLogado?.cargo !== "diretoria") {
       alert("Somente diretoria pode alterar permissões de outra diretoria.");
+      return;
+    }
+
+    // No modo TESTE SEGURO a permissão pode ser alterada visualmente para
+    // validar o fluxo, mas nenhuma escrita é enviada ao Supabase original.
+    if (READ_ONLY_MODE) {
+      const correspondeAoAlvo = (u: Usuario) =>
+        alvo.id ? u.id === alvo.id : u.login === alvo.login;
+
+      setUsuarios((lista) =>
+        lista.map((u) =>
+          correspondeAoAlvo(u) ? { ...u, [chave]: valor } : u
+        )
+      );
+      setUsuarioEdicao((atual) =>
+        atual && correspondeAoAlvo(atual)
+          ? { ...atual, [chave]: valor }
+          : atual
+      );
+      return;
+    }
+
+    if (!alvo.id) {
+      alert("Não foi possível identificar esse usuário no banco.");
       return;
     }
 
@@ -5409,6 +6879,150 @@ export default function DubworksManager() {
     URL.revokeObjectURL(url);
   }
 
+  async function exportarRelatorioProjetosAtivosCSV() {
+    if (!projetosAtivosRelatorio.length) {
+      alert("Não há projetos ativos disponíveis para exportação.");
+      return;
+    }
+
+    try {
+      const atividadeAtualizada = await carregarAtividadeSemanalProjetosBanco(
+        projetosAtivosRelatorio
+      );
+
+      setAtividadeSemanalProjetos(atividadeAtualizada);
+
+      const cabecalhos = [
+        "ID_Projeto",
+        "Projeto",
+        "Status_Projeto",
+        "Lider",
+        "Editor",
+        "Semana_Atual",
+        "Status_Semana",
+        "Situacao_Atual",
+        "Participantes_Previstos",
+        "Entregaram",
+        "Nao_Entregaram",
+        "Aguardando_Analise",
+        "Aprovados",
+        "Regravacoes",
+        "Progresso_Recebimento",
+        "Progresso_Aprovacao",
+        "Prazo_Semana",
+        "Ultima_Atividade",
+        "Pendentes_Entrega",
+        "Pendentes_Analise",
+        "Pendentes_Regravacao",
+      ];
+
+      const porProjeto = new Map(
+        atividadeAtualizada.map((item) => [String(item.projetoId), item])
+      );
+
+      const formatarDataExportacao = (valor?: string | null) => {
+        if (!valor) return "";
+        const data = new Date(valor);
+        if (Number.isNaN(data.getTime())) return String(valor);
+        return data.toLocaleString("pt-BR", {
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+      };
+
+      const listarParticipantes = (
+        item: AtividadeSemanalProjeto,
+        status: AtividadeSemanalProjeto["participantes"][number]["status"]
+      ) =>
+        item.participantes
+          .filter((participante) => participante.status === status)
+          .map((participante) =>
+            [participante.personagem, participante.dublador]
+              .filter(Boolean)
+              .join(" — ")
+          )
+          .filter(Boolean)
+          .join(" | ");
+
+      const linhas = projetosAtivosRelatorio.map((projeto) => {
+        const item = porProjeto.get(String(projeto.ID));
+
+        if (!item) {
+          return [
+            projeto.ID,
+            projeto.Projeto,
+            projeto.Status,
+            projeto.Lider,
+            projeto.Editor,
+            "",
+            "",
+            "Em organização",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0%",
+            "0%",
+            "",
+            "",
+            "",
+            "",
+            "",
+          ]
+            .map(escaparCSV)
+            .join(";");
+        }
+
+        return [
+          item.projetoId,
+          item.projeto,
+          item.statusProjeto,
+          item.lider,
+          item.editor,
+          item.semana != null ? String(item.semana) : "",
+          item.semanaStatus || "",
+          infoSituacaoAtividadeSemanal(item.situacao).label,
+          String(item.previstos),
+          String(item.entregaram),
+          String(item.naoEntregaram),
+          String(item.pendentes),
+          String(item.aprovados),
+          String(item.regravacoes),
+          `${item.progressoRecebimento}%`,
+          `${item.progressoAprovacao}%`,
+          formatarDataExportacao(item.prazoEm),
+          formatarDataExportacao(item.ultimaAtividade),
+          listarParticipantes(item, "nao_entregou"),
+          listarParticipantes(item, "aguardando_analise"),
+          listarParticipantes(item, "regravacao"),
+        ]
+          .map(escaparCSV)
+          .join(";");
+      });
+
+      const conteudo = "\uFEFF" + [cabecalhos.join(";"), ...linhas].join("\n");
+      const blob = new Blob([conteudo], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `relatorio_projetos_ativos_dubworks_${new Date()
+        .toISOString()
+        .slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (erro) {
+      console.error("Erro ao exportar relatório dos projetos ativos:", erro);
+      alert("Não foi possível montar o relatório dos projetos ativos neste momento.");
+    }
+  }
+
   function exportarElencoCSV() {
     const cabecalhos = [
       "Projeto",
@@ -5455,44 +7069,529 @@ export default function DubworksManager() {
     URL.revokeObjectURL(url);
   }
 
-  async function alterarStatusMembro(membro: Membro, status: StatusMembro) {
-    if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return;
+  async function carregarStatusWhatsappBridge(mostrarErro = false) {
+    if (carregandoWhatsappBridge) return;
+    setCarregandoWhatsappBridge(true);
+    try {
+      const controlador = new AbortController();
+      const timeout = window.setTimeout(() => controlador.abort(), 5000);
+      const resposta = await fetch(`${WHATSAPP_BRIDGE_URL}/api/status`, {
+        signal: controlador.signal,
+        cache: "no-store",
+      });
+      window.clearTimeout(timeout);
+      const json = await resposta.json();
+      if (!resposta.ok || !json?.ok) {
+        throw new Error(json?.error || "Bridge do WhatsApp indisponível.");
+      }
+      const estado = String(json.whatsapp?.state || "desconhecido");
+      setWhatsappBridge({
+        state: estado,
+        detail: String(json.whatsapp?.detail || ""),
+        qr_data_url: String(json.whatsapp?.qr_data_url || ""),
+        numero: String(json.whatsapp?.numero || ""),
+      });
+      return estado;
+    } catch (error: any) {
+      const detail =
+        error?.name === "AbortError"
+          ? "O bridge do WhatsApp não respondeu a tempo."
+          : "Bridge local do WhatsApp não está rodando. Abra o INICIAR-WHATSAPP.cmd.";
+      setWhatsappBridge({ state: "offline", detail });
+      if (mostrarErro) alert(detail);
+      return "offline";
+    } finally {
+      setCarregandoWhatsappBridge(false);
+    }
+  }
 
-    const confirmar = confirm(
-      `Alterar status de ${membro.nome} para "${statusMembroLabel(status)}"?`
+  function salvarMensagensBaseWhatsapp() {
+    try {
+      window.localStorage.setItem(WHATSAPP_MSG_01_KEY, mensagemWhatsapp01);
+      window.localStorage.setItem(WHATSAPP_MSG_02_KEY, mensagemWhatsapp02);
+      alert("Mensagens-base do WhatsApp salvas neste computador.");
+    } catch {
+      alert("Não consegui salvar as mensagens-base neste navegador.");
+    }
+  }
+
+  function aplicarTemplateWhatsapp(template: string, membro: Membro) {
+    const ator = atorAtualMembro();
+    const valores: Record<string, string> = {
+      nome: membro.nome || "[NOME DA PESSOA]",
+      responsavel: ator.nome || "[RESPONSÁVEL]",
+      cargo: ator.cargo || "[CARGO]",
+    };
+
+    return String(template || "").replace(
+      /\{(nome|responsavel|cargo)\}/g,
+      (_, chave: string) => valores[chave] || ""
+    );
+  }
+
+  async function enviarChamadaWhatsapp(membro: Membro) {
+    if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return;
+    if (!WHATSAPP_SEND_ENABLED) {
+      alert("Modo de teste: o envio real pelo WhatsApp está desativado. A prévia e a conexão podem ser testadas sem enviar mensagem.");
+      return;
+    }
+    if (enviandoWhatsappMembroId) return;
+
+    const telefone = String(membro.telefone || "").trim();
+    if (!telefone) {
+      alert("Este membro não possui número de WhatsApp cadastrado.");
+      return;
+    }
+
+    const template = tipoMensagemWhatsapp === "01" ? mensagemWhatsapp01 : mensagemWhatsapp02;
+    const mensagem = aplicarTemplateWhatsapp(template, membro).trim();
+    if (!mensagem) {
+      alert("A mensagem-base selecionada está vazia.");
+      return;
+    }
+
+    if (whatsappBridge.state !== "pronto") {
+      await carregarStatusWhatsappBridge(true);
+      return;
+    }
+
+    const confirmarEnvio = window.confirm(
+      `Enviar a mensagem ${tipoMensagemWhatsapp} para ${membro.nome || telefone}?\n\n` +
+        `Ao confirmar o envio, o atendimento será atualizado automaticamente para ${tipoMensagemWhatsapp}.`
+    );
+    if (!confirmarEnvio) return;
+
+    setEnviandoWhatsappMembroId(membro.id);
+    try {
+      const resposta = await fetch(`${WHATSAPP_BRIDGE_URL}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ telefone, mensagem }),
+      });
+      const json = await resposta.json();
+      if (!resposta.ok || !json?.ok) {
+        throw new Error(json?.error || "Falha ao enviar pelo WhatsApp.");
+      }
+
+      const sincronizado = await alterarAtendimentoMembro(
+        membro,
+        tipoMensagemWhatsapp as AtendimentoMembro
+      );
+
+      if (sincronizado) {
+        alert(
+          `Mensagem ${tipoMensagemWhatsapp} enviada para ${membro.nome || telefone} e atendimento sincronizado com a ficha.`
+        );
+      } else {
+        alert(
+          `A mensagem foi enviada pelo WhatsApp, mas não consegui sincronizar o status ${tipoMensagemWhatsapp} com a planilha.`
+        );
+      }
+    } catch (error: any) {
+      const detalhe = String(error?.message || error);
+      await alterarAtendimentoMembro(membro, "erro");
+      alert(`Não consegui enviar a mensagem pelo WhatsApp: ${detalhe}`);
+    } finally {
+      setEnviandoWhatsappMembroId(null);
+      void carregarStatusWhatsappBridge(false);
+    }
+  }
+
+  function segundosFilaWhatsappAleatorios() {
+    const intervalo = WHATSAPP_QUEUE_MAX_SECONDS - WHATSAPP_QUEUE_MIN_SECONDS + 1;
+    return Math.floor(Math.random() * intervalo) + WHATSAPP_QUEUE_MIN_SECONDS;
+  }
+
+  function formatarEsperaFilaWhatsapp(segundos: number | null) {
+    if (segundos === null) return "";
+    if (segundos < 60) return `${segundos}s`;
+    const minutos = Math.floor(segundos / 60);
+    const resto = segundos % 60;
+    return resto ? `${minutos}min ${resto}s` : `${minutos}min`;
+  }
+
+  async function aguardarIntervaloFilaWhatsapp(segundos: number) {
+    let restante = segundos;
+    setFilaWhatsappProximoEm(restante);
+    while (restante > 0) {
+      if (filaWhatsappCancelarRef.current) {
+        setFilaWhatsappProximoEm(null);
+        return false;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+      restante -= 1;
+      setFilaWhatsappProximoEm(restante);
+    }
+    setFilaWhatsappProximoEm(null);
+    return !filaWhatsappCancelarRef.current;
+  }
+
+  function pararFilaChamadasWhatsapp() {
+    filaWhatsappCancelarRef.current = true;
+    setFilaWhatsappAtual("Parando fila após o intervalo atual...");
+  }
+
+  async function iniciarFilaChamadasWhatsapp() {
+    if (!podeGerenciarMembros(usuarioLogado) || filaWhatsappAtiva) return;
+    if (!WHATSAPP_SEND_ENABLED) {
+      alert("Modo de teste: a fila real de WhatsApp está desativada para evitar envios durante os testes.");
+      return;
+    }
+
+    const pendentes = membros.filter((membro) => {
+      const atendimento = String(membro.atendimento || "chamar").toLowerCase();
+      const telefone = String(membro.telefone || "").replace(/\D/g, "");
+      return atendimento === "chamar" && telefone.length >= 10;
+    });
+    const semTelefone = membros.filter((membro) => {
+      const atendimento = String(membro.atendimento || "chamar").toLowerCase();
+      const telefone = String(membro.telefone || "").replace(/\D/g, "");
+      return atendimento === "chamar" && telefone.length < 10;
+    }).length;
+
+    if (!pendentes.length) {
+      alert(
+        semTelefone
+          ? `Não há fichas em Chamar com WhatsApp válido. Existem ${semTelefone} ficha(s) sem telefone válido.`
+          : "Não há membros com Atendimento = Chamar."
+      );
+      return;
+    }
+
+    const estado =
+      whatsappBridge.state === "pronto"
+        ? "pronto"
+        : await carregarStatusWhatsappBridge(true);
+    if (estado !== "pronto") return;
+
+    const confirmar = window.confirm(
+      `Iniciar a fila de WhatsApp para ${pendentes.length} membro(s) com Atendimento = Chamar?\n\n` +
+        `Será usada a Mensagem 01. Antes de cada envio o sistema aguardará um tempo aleatório entre ${WHATSAPP_QUEUE_MIN_SECONDS} segundos e 5 minutos.\n\n` +
+        `Mantenha esta página aberta enquanto a fila estiver rodando.${semTelefone ? `\n\n${semTelefone} ficha(s) sem telefone válido serão ignoradas.` : ""}`
     );
     if (!confirmar) return;
+
+    filaWhatsappCancelarRef.current = false;
+    setFilaWhatsappAtiva(true);
+    setFilaWhatsappTotal(pendentes.length);
+    setFilaWhatsappProcessados(0);
+    setFilaWhatsappResumo("");
+
+    let enviados = 0;
+    let erros = 0;
+    let processados = 0;
+
+    try {
+      for (const membro of pendentes) {
+        if (filaWhatsappCancelarRef.current) break;
+
+        const espera = segundosFilaWhatsappAleatorios();
+        setFilaWhatsappAtual(`Próximo: ${membro.nome || membro.telefone || "membro"}`);
+        const continuar = await aguardarIntervaloFilaWhatsapp(espera);
+        if (!continuar) break;
+
+        const telefone = String(membro.telefone || "").trim();
+        const mensagem = aplicarTemplateWhatsapp(mensagemWhatsapp01, membro).trim();
+        setEnviandoWhatsappMembroId(membro.id || null);
+        setFilaWhatsappAtual(`Enviando para ${membro.nome || telefone}...`);
+
+        try {
+          const resposta = await fetch(`${WHATSAPP_BRIDGE_URL}/api/send`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ telefone, mensagem }),
+          });
+          const json = await resposta.json();
+          if (!resposta.ok || !json?.ok) {
+            throw new Error(json?.error || "Falha ao enviar pelo WhatsApp.");
+          }
+
+          const sincronizado = await alterarAtendimentoMembro(membro, "01");
+          if (sincronizado) {
+            enviados += 1;
+          } else {
+            erros += 1;
+            await alterarAtendimentoMembro(membro, "erro");
+          }
+        } catch {
+          erros += 1;
+          await alterarAtendimentoMembro(membro, "erro");
+        } finally {
+          processados += 1;
+          setFilaWhatsappProcessados(processados);
+          setEnviandoWhatsappMembroId(null);
+        }
+      }
+    } finally {
+      const cancelada = filaWhatsappCancelarRef.current;
+      setFilaWhatsappAtiva(false);
+      setFilaWhatsappProximoEm(null);
+      setFilaWhatsappAtual("");
+      setEnviandoWhatsappMembroId(null);
+      filaWhatsappCancelarRef.current = false;
+      const resumo = `${cancelada ? "Fila interrompida" : "Fila finalizada"}: ${enviados} enviado(s), ${erros} erro(s), ${processados}/${pendentes.length} processado(s).`;
+      setFilaWhatsappResumo(resumo);
+      void carregarStatusWhatsappBridge(false);
+      alert(resumo);
+    }
+  }
+
+  function atorAtualMembro() {
+    return {
+      nome: usuarioLogado?.nome || usuarioLogado?.login || "DubWorks Manager",
+      cargo: usuarioLogado ? cargoLabel(usuarioLogado.cargo) : "",
+    };
+  }
+
+  async function recarregarHistoricoMembro(membroId: number) {
+    setCarregandoHistoricoMembro(true);
+    try {
+      const eventos = await carregarHistoricoMembroPlanilha(membroId);
+      setHistoricoMembroSelecionado(eventos);
+    } finally {
+      setCarregandoHistoricoMembro(false);
+    }
+  }
+
+  async function selecionarMembroTabela(membro: Membro) {
+    if (!membro.id) return;
+    if (membroSelecionadoId === membro.id) {
+      setMembroSelecionadoId(null);
+      setMembroEmEdicaoId(null);
+      setRascunhoMembroEdicao(null);
+      setHistoricoMembroSelecionado([]);
+      return;
+    }
+
+    setMembroSelecionadoId(membro.id);
+    setMembroEmEdicaoId(null);
+    setRascunhoMembroEdicao(null);
+    setHistoricoMembroSelecionado([]);
+    await recarregarHistoricoMembro(membro.id);
+  }
+
+  function iniciarEdicaoMembro(membro: Membro) {
+    if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return;
+    setMembroEmEdicaoId(membro.id);
+    setRascunhoMembroEdicao({ ...membro });
+  }
+
+  function cancelarEdicaoMembro() {
+    setMembroEmEdicaoId(null);
+    setRascunhoMembroEdicao(null);
+  }
+
+  async function salvarEdicaoMembro(membro: Membro) {
+    if (!membro.id || !rascunhoMembroEdicao || !podeGerenciarMembros(usuarioLogado)) return;
+
+    const rascunho = rascunhoMembroEdicao;
+    const alteracoes: Record<string, string | null> = {};
+
+    if (String(membro.nome || "") !== String(rascunho.nome || "")) {
+      alteracoes.nome = String(rascunho.nome || "") || null;
+    }
+    if (String(membro.telefone || "") !== String(rascunho.telefone || "")) {
+      alteracoes.telefone = String(rascunho.telefone || "") || null;
+    }
+    if (String(membro.observacao || "") !== String(rascunho.observacao || "")) {
+      alteracoes.observacao = String(rascunho.observacao || "") || null;
+    }
+
+    if (!Object.keys(alteracoes).length) {
+      cancelarEdicaoMembro();
+      return;
+    }
+
+    setSalvandoEdicaoMembro(true);
+    try {
+      // Uma única chamada para a planilha, mesmo quando nome, telefone e
+      // observação foram alterados juntos.
+      const ok = await atualizarMembroCamposPlanilha(
+        membro.id,
+        alteracoes,
+        atorAtualMembro()
+      );
+
+      if (!ok) {
+        alert("Não consegui salvar as alterações na planilha.");
+        return;
+      }
+
+      setMembros((lista) =>
+        lista.map((item) =>
+          item.id === membro.id ? { ...item, ...alteracoes } as Membro : item
+        )
+      );
+      cancelarEdicaoMembro();
+      if (membroSelecionadoId === membro.id) {
+        await recarregarHistoricoMembro(membro.id);
+      }
+    } finally {
+      setSalvandoEdicaoMembro(false);
+    }
+  }
+
+  async function alterarStatusMembro(membro: Membro, status: StatusMembro) {
+    if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return;
+    if (membro.status === status) return;
+
+    const confirmar = confirm(
+      `Alterar a participação de ${membro.nome} para "${statusMembroLabel(status)}"?`
+    );
+    if (!confirmar) return;
+
+    const statusAnterior = membro.status;
+    const hoje = new Date().toISOString().slice(0, 10);
+
+    // Atualiza a tela imediatamente. Não faz uma nova leitura das 600+ linhas.
+    setMembros((lista) =>
+      lista.map((item) => {
+        if (item.id !== membro.id) return item;
+        const atualizado: Membro = { ...item, status };
+        if (status === "na_comunidade") {
+          atualizado.data_entrada = hoje;
+          atualizado.data_saida = null;
+        } else if (status === "saiu" || status === "banido") {
+          atualizado.data_saida = hoje;
+        }
+        return atualizado;
+      })
+    );
 
     const ok = await atualizarStatusMembroBanco(
       membro.id,
       status,
-      membro.observacao
+      atorAtualMembro()
     );
 
     if (!ok) {
-      alert("Não consegui atualizar o membro.");
+      // Se a gravação falhar, volta o status visual anterior para não criar
+      // divergência silenciosa entre o Manager e a planilha.
+      setMembros((lista) =>
+        lista.map((item) =>
+          item.id === membro.id ? { ...item, status: statusAnterior } : item
+        )
+      );
+      alert("Não consegui atualizar a participação do membro.");
       return;
     }
 
-    await recarregarMembros();
+    if (membroSelecionadoId === membro.id) {
+      const titulo =
+        status === "banido"
+          ? "Foi banido da comunidade"
+          : status === "saiu"
+          ? "Saiu da comunidade"
+          : status === "somente_canais"
+          ? "Passou a participar apenas pelos canais"
+          : status === "pausado"
+          ? "Participação pausada"
+          : status === "na_comunidade"
+          ? ["saiu", "banido", "somente_canais", "pausado"].includes(statusAnterior)
+            ? "Retornou para a comunidade"
+            : "Entrou na comunidade"
+          : "Participação atualizada";
+      setHistoricoMembroSelecionado((eventos) => [
+        {
+          id: `local-participacao-${Date.now()}`,
+          data: new Date().toISOString(),
+          tipo: "participacao",
+          titulo,
+          valor_anterior: statusMembroLabel(statusAnterior),
+          valor_novo: statusMembroLabel(status),
+          usuario: atorAtualMembro().nome,
+          cargo: atorAtualMembro().cargo,
+        },
+        ...eventos,
+      ]);
+    }
+  }
+
+  async function alterarAtendimentoMembro(
+    membro: Membro,
+    atendimento: AtendimentoMembro
+  ): Promise<boolean> {
+    if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return false;
+    const atendimentoAnterior = String(membro.atendimento || "chamar") as AtendimentoMembro;
+    if (atendimentoAnterior === atendimento) return true;
+
+    // Resposta imediata na interface; a gravação na planilha acontece com
+    // apenas uma chamada e sem recarregar toda a lista em seguida.
+    setMembros((lista) =>
+      lista.map((item) =>
+        item.id === membro.id ? { ...item, atendimento } : item
+      )
+    );
+
+    const ok = await atualizarAtendimentoMembroBanco(
+      membro.id,
+      atendimento,
+      atorAtualMembro()
+    );
+
+    if (!ok) {
+      setMembros((lista) =>
+        lista.map((item) =>
+          item.id === membro.id ? { ...item, atendimento: atendimentoAnterior } : item
+        )
+      );
+      alert("Não consegui atualizar o atendimento do membro.");
+      return false;
+    }
+
+    if (membroSelecionadoId === membro.id) {
+      const titulo =
+        atendimento === "01"
+          ? "Atendimento avançou para 1"
+          : atendimento === "02"
+          ? "Atendimento avançou para 2"
+          : atendimento === "concluido"
+          ? "Atendimento concluído"
+          : atendimento === "erro"
+          ? "Atendimento marcado com erro"
+          : "Marcado para chamar";
+      setHistoricoMembroSelecionado((eventos) => [
+        {
+          id: `local-atendimento-${Date.now()}`,
+          data: new Date().toISOString(),
+          tipo: "atendimento",
+          titulo,
+          valor_anterior: atendimentoMembroLabel(atendimentoAnterior),
+          valor_novo: atendimentoMembroLabel(atendimento),
+          usuario: atorAtualMembro().nome,
+          cargo: atorAtualMembro().cargo,
+        },
+        ...eventos,
+      ]);
+    }
+    return true;
   }
 
   async function atualizarMembroCampo(
     membro: Membro,
-    campo: "data_entrada" | "data_saida" | "observacao",
+    campo:
+      | "nome"
+      | "telefone"
+      | "data_entrada"
+      | "data_saida"
+      | "observacao"
+      | "movimentacao",
     valor: string
   ) {
     if (!membro.id || !podeGerenciarMembros(usuarioLogado)) return;
 
-    const payload: any = { [campo]: valor || null };
-    const { error } = await supabase
-      .from("membros")
-      .update(payload)
-      .eq("id", membro.id);
+    const atual = String((membro as any)[campo] || "");
+    if (atual === String(valor || "")) return;
 
-    if (error) {
-      console.error("Erro ao atualizar membro:", error);
-      alert("Não consegui atualizar o membro.");
+    const ok = await atualizarMembroCampoPlanilha(
+      membro.id,
+      campo,
+      valor || null,
+      atorAtualMembro()
+    );
+
+    if (!ok) {
+      alert("Não consegui atualizar o membro na planilha.");
       return;
     }
 
@@ -5540,6 +7639,27 @@ export default function DubworksManager() {
     a.download = `membros_dubworks_${new Date()
       .toISOString()
       .slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function baixarBackupMembrosJSON() {
+    const pacote = {
+      versao: 1,
+      origem: "DubWorks Manager - Central de Membros",
+      gerado_em: new Date().toISOString(),
+      total: membros.length,
+      membros,
+    };
+    const blob = new Blob([JSON.stringify(pacote, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `backup_membros_dubworks_${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -5846,6 +7966,8 @@ export default function DubworksManager() {
 
   const observacoesVisiveis = (projetoPainel?.Observacoes || "")
     .replace(/\[\[DRIVE_LINKS\]\][\s\S]*?\[\[\/DRIVE_LINKS\]\]/g, "")
+    .replace(/\[\[RESPONSAVEIS_PROJETO\]\][\s\S]*?\[\[\/RESPONSAVEIS_PROJETO\]\]/gi, "")
+    .replace(/\[\[CATEGORIA_PROJETO\]\][\s\S]*?\[\[\/CATEGORIA_PROJETO\]\]/gi, "")
     .trim();
 
   const driveLinks: {
@@ -5939,7 +8061,7 @@ export default function DubworksManager() {
         }
 
         const vinculo = normalizar(
-          usuarioLogado.vinculo || usuarioLogado.nome || usuarioLogado.login
+          usuarioLogado.login || usuarioLogado.vinculo || usuarioLogado.nome || usuarioLogado.login
         );
 
         if (
@@ -5970,9 +8092,6 @@ export default function DubworksManager() {
     }
     window.open(link, "_blank", "noopener,noreferrer");
   }
-
-  const membroSelecionado =
-    membros.find((m) => m.id === membroSelecionadoId) || null;
 
   function cargoMembro(membro: Membro | null) {
     if (!membro) return "Membro";
@@ -6012,6 +8131,213 @@ export default function DubworksManager() {
     setRegistroSemanalTexto("");
     await recarregarProjetos();
     alert("Registro semanal salvo com data e hora.");
+  }
+
+  async function carregarItensRelatorioSemana(
+    projeto: Projeto,
+    semana: number
+  ) {
+    const participantes = await carregarParticipantesSemanaBanco(
+      projeto.ID,
+      semana
+    );
+
+    const entregasSemana = entregasProducao
+      .filter((entrega) => numeroSemanaEntrega(entrega.semana) === semana)
+      .slice()
+      .sort((a, b) => {
+        const dataA = Math.max(
+          a.data_avaliacao ? new Date(a.data_avaliacao).getTime() : 0,
+          a.data_envio ? new Date(a.data_envio).getTime() : 0
+        );
+        const dataB = Math.max(
+          b.data_avaliacao ? new Date(b.data_avaliacao).getTime() : 0,
+          b.data_envio ? new Date(b.data_envio).getTime() : 0
+        );
+        return dataB - dataA;
+      });
+
+    const telefoneLimpo = (valor?: string | null) =>
+      String(valor || "").replace(/\D/g, "");
+
+    setItensRelatorioProjeto(
+      participantes.map((item) => {
+        const telefone = telefoneLimpo(item.telefone_dublador);
+        const entrega = entregasSemana.find((candidata) => {
+          const telefoneEntrega = telefoneLimpo(candidata.telefone);
+          if (
+            normalizar(candidata.personagem) !== normalizar(item.personagem)
+          ) {
+            return false;
+          }
+          if (telefone && telefoneEntrega && telefone === telefoneEntrega) return true;
+          return normalizar(candidata.dublador) === normalizar(item.dublador);
+        });
+
+        const status: StatusItemRelatorioProjeto = !entrega
+          ? "nao_entregou"
+          : entrega.status === "aprovado"
+          ? "aprovado"
+          : entrega.status === "regravacao"
+          ? "regravacao"
+          : "aguardando_analise";
+
+        return {
+          personagem: item.personagem || "",
+          dublador: item.dublador || "",
+          telefone: item.telefone_dublador || "",
+          status,
+          observacao: entrega?.comentario || "",
+        };
+      })
+    );
+  }
+
+  function atualizarItemRelatorioProjeto(
+    indice: number,
+    alteracao: Partial<ItemRelatorioProjeto>
+  ) {
+    setItensRelatorioProjeto((lista) =>
+      lista.map((item, i) => (i === indice ? { ...item, ...alteracao } : item))
+    );
+  }
+
+  function limparFormularioRelatorioProjeto() {
+    setAndamentoRelatorioProjeto("");
+    setDificuldadesRelatorioProjeto("");
+    setSuporteRelatorioProjeto("");
+    setObservacoesRelatorioProjeto("");
+    setMaterialNomeRelatorioProjeto("");
+    setMaterialLinkRelatorioProjeto("");
+    setMaterialObservacaoRelatorioProjeto("");
+  }
+
+  async function salvarRelatorioProjetoAtual() {
+    if (!projetoPainel || salvandoRelatorioProjeto) return;
+
+    if (tipoRelatorioProjeto === "semanal" && !semanaRelatorioProjeto) {
+      alert("Selecione a semana do relatório.");
+      return;
+    }
+
+    if (tipoRelatorioProjeto === "material" && !materialNomeRelatorioProjeto.trim()) {
+      alert("Informe qual material/episódio foi concluído.");
+      return;
+    }
+
+    const relatorio: RelatorioProjetoEstruturado = {
+      id: `rel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      tipo: tipoRelatorioProjeto,
+      projetoId: projetoPainel.ID,
+      criadoEm: new Date().toISOString(),
+      criadoPor: usuarioLogado?.nome || usuarioLogado?.login || "Sistema",
+      ...(tipoRelatorioProjeto === "semanal"
+        ? {
+            semana: semanaRelatorioProjeto,
+            andamento: andamentoRelatorioProjeto.trim(),
+            dificuldades: dificuldadesRelatorioProjeto.trim(),
+            suporte: suporteRelatorioProjeto.trim(),
+            observacoes: observacoesRelatorioProjeto.trim(),
+            itens: itensRelatorioProjeto,
+          }
+        : {
+            materialNome: materialNomeRelatorioProjeto.trim(),
+            materialLink: materialLinkRelatorioProjeto.trim(),
+            materialObservacao: materialObservacaoRelatorioProjeto.trim(),
+          }),
+    };
+
+    const linhaRelatorio = `${RELATORIO_PROJETO_PREFIXO}${JSON.stringify(relatorio)}`;
+    const registroAtual = projetoPainel.Registro_Semanal || "";
+    const projetoAtualizado: Projeto = {
+      ...projetoPainel,
+      Registro_Semanal: [linhaRelatorio, registroAtual].filter(Boolean).join("\n"),
+    };
+
+    try {
+      setSalvandoRelatorioProjeto(true);
+      const ok = await atualizarProjetoBanco(projetoAtualizado);
+      if (!ok) {
+        alert("Não consegui salvar o relatório.");
+        return;
+      }
+
+      limparFormularioRelatorioProjeto();
+      await recarregarProjetos();
+      alert(
+        tipoRelatorioProjeto === "semanal"
+          ? "Relatório semanal salvo."
+          : "Material concluído registrado."
+      );
+    } finally {
+      setSalvandoRelatorioProjeto(false);
+    }
+  }
+
+  async function abrirVagaEmergencialPorRelatorio(item: ItemRelatorioProjeto) {
+    if (!projetoPainel) return;
+    const papel = (projetoPainel.Elenco || []).find(
+      (elenco) => normalizar(elenco.personagem) === normalizar(item.personagem)
+    );
+
+    if (!papel?.id) {
+      alert(
+        `Não encontrei ${item.personagem} no Banco do Projeto. Abra o Banco & Semanas para revisar este papel.`
+      );
+      return;
+    }
+
+    await reabrirPapelProjeto(papel);
+  }
+
+  function abrirAreaProjetosParaTutorial() {
+    setMostrarTreinamentos(false);
+    setMostrarFerramentas(false);
+    setMostrarAdvertencias(false);
+    setMostrarEventos(false);
+    setMostrarMarketing(false);
+    setMostrarMembros(false);
+    setMostrarUsuarios(false);
+    setMostrarRelatorios(false);
+    setMostrarNovoProjeto(false);
+    setSelecionadoId(null);
+    setRascunho(null);
+    setAbaProjeto("informacoes");
+    setMenuMobileAberto(false);
+  }
+
+  async function prepararPassoTutorialProjeto(indice: number) {
+    const limite = TUTORIAL_PROJETO_PASSOS.length - 1;
+    const proximo = Math.max(0, Math.min(indice, limite));
+
+    if (proximo <= 1) {
+      abrirAreaProjetosParaTutorial();
+    } else if (proximo === 2) {
+      abrirAreaProjetosParaTutorial();
+      limparFormularioProjeto();
+      setMostrarNovoProjeto(true);
+    } else {
+      setMostrarNovoProjeto(false);
+      if (!selecionadoId) {
+        const primeiro = projetosVisiveis[0] || projetos[0];
+        if (primeiro?.ID) abrirPaginaProjeto(primeiro.ID);
+      }
+      if (proximo === 4) setAbaProjeto("elenco");
+      if (proximo === 5) setAbaProjeto("relatorios");
+    }
+
+    setTutorialProjetoPasso(proximo);
+  }
+
+  function iniciarTutorialPraticoProjetos() {
+    setTutorialProjetoAtivo(true);
+    void prepararPassoTutorialProjeto(0);
+  }
+
+  function encerrarTutorialPraticoProjetos() {
+    setTutorialProjetoAtivo(false);
+    setTutorialProjetoRect(null);
+    setMostrarNovoProjeto(false);
   }
 
   const SidebarItem = ({
@@ -6101,176 +8427,518 @@ export default function DubworksManager() {
     </div>
   );
 
-  const ProjectList = () => (
-    <div
-      style={{
-        ...painelDarkStyle,
-        minHeight: 240,
-        overflow: "hidden",
-      }}
-    >
-      <div style={painelHeaderStyle}>
-        <h2 style={tituloCardDarkStyle}>Projetos ativos</h2>
-        <span style={{ color: "#94a3b8", fontSize: 13 }}>
-          {filtrados.length} projeto(s)
-        </span>
-      </div>
+  const ProjectList = () => {
+    const paginaInicial = Math.max(1, paginaProjetos - 2);
+    const paginaFinal = Math.min(totalPaginasProjetos, paginaInicial + 4);
+    const paginasVisiveis = Array.from(
+      { length: Math.max(0, paginaFinal - paginaInicial + 1) },
+      (_, indice) => paginaInicial + indice
+    );
 
-      {isMobile ? (
-        <div className="dw-mobile-project-list">
-          {filtrados.slice(0, 35).map((p) => {
-            const statusCor = corStatus(p.Status);
-            const ativo = p.ID === projetoPainel?.ID;
+    function estiloStatusProjeto(status?: string) {
+      const valor = normalizarStatusProjetoUI(status);
 
-            return (
-              <button
-                key={p.ID}
-                type="button"
-                className={
-                  ativo
-                    ? "dw-mobile-project-card active"
-                    : "dw-mobile-project-card"
-                }
-                onClick={() => setSelecionadoId(p.ID)}
-              >
-                <div className="dw-mobile-project-cover">
-                  {p.Capa_URL ? (
-                    <img src={p.Capa_URL} alt={p.Projeto} />
-                  ) : (
-                    <span>📁</span>
-                  )}
-                </div>
+      if (valor === "Seleção") {
+        return {
+          background: "rgba(30,58,138,.76)",
+          border: "rgba(59,130,246,.58)",
+          color: "#dbeafe",
+        };
+      }
 
-                <div className="dw-mobile-project-content">
-                  <div className="dw-mobile-project-title">
-                    <strong>{p.Projeto || "Projeto sem nome"}</strong>
-                    <span>#{p.ID}</span>
-                  </div>
+      if (valor === "Aguardando aprovação") {
+        return {
+          background: "rgba(76,29,149,.76)",
+          border: "rgba(139,92,246,.58)",
+          color: "#ede9fe",
+        };
+      }
 
-                  <div className="dw-mobile-project-badges">
-                    <span className="dw-chip dw-chip-blue">
-                      {p.Tipo || "-"}
-                    </span>
-                    <span className="dw-chip dw-chip-red">
-                      {p.Prioridade || "-"}
-                    </span>
-                    <span
-                      className="dw-chip"
-                      style={{
-                        background: statusCor.bg,
-                        color: statusCor.color,
-                      }}
-                    >
-                      {p.Status || "Sem status"}
-                    </span>
-                  </div>
+      if (valor === "Aguardando início") {
+        return {
+          background: "rgba(120,53,15,.82)",
+          border: "rgba(245,158,11,.56)",
+          color: "#fef3c7",
+        };
+      }
 
-                  <div className="dw-mobile-project-meta">
-                    <span>
-                      <b>Gênero:</b> {p.Genero || "-"}
-                    </span>
-                    <span>
-                      <b>Líder:</b> {p.Lider || "-"}
-                    </span>
-                    <span>
-                      <b>Editor:</b> {p.Editor || "-"}
-                    </span>
-                    <span>
-                      <b>Elenco:</b> {p.Elenco.length} registro(s)
-                    </span>
-                  </div>
-                </div>
-              </button>
-            );
-          })}
+      if (valor === "Planejamento") {
+        return {
+          background: "rgba(51,65,85,.86)",
+          border: "rgba(148,163,184,.42)",
+          color: "#e2e8f0",
+        };
+      }
+
+      if (valor === "Em andamento") {
+        return {
+          background: "rgba(6,78,59,.78)",
+          border: "rgba(16,185,129,.52)",
+          color: "#d1fae5",
+        };
+      }
+
+      if (valor === "Em edição") {
+        return {
+          background: "rgba(12,74,110,.78)",
+          border: "rgba(56,189,248,.52)",
+          color: "#e0f2fe",
+        };
+      }
+
+      if (valor === "Pausado") {
+        return {
+          background: "rgba(63,63,70,.84)",
+          border: "rgba(161,161,170,.46)",
+          color: "#f4f4f5",
+        };
+      }
+
+      if (valor === "Interrompido") {
+        return {
+          background: "rgba(127,29,29,.80)",
+          border: "rgba(239,68,68,.52)",
+          color: "#fee2e2",
+        };
+      }
+
+      if (valor === "Finalizado") {
+        return {
+          background: "rgba(20,83,45,.80)",
+          border: "rgba(34,197,94,.52)",
+          color: "#dcfce7",
+        };
+      }
+
+      return {
+        background: "rgba(30,41,59,.88)",
+        border: "rgba(100,116,139,.42)",
+        color: "#e2e8f0",
+      };
+    }
+
+    return (
+      <section
+        data-tutorial-projetos="lista-projetos"
+        style={{
+          ...painelDarkStyle,
+          minHeight: 260,
+          overflow: "hidden",
+          padding: isMobile ? 14 : 16,
+        }}
+      >
+        <div
+          style={{
+            ...painelHeaderStyle,
+            paddingBottom: 14,
+            borderBottom: "1px solid rgba(148,163,184,.10)",
+          }}
+        >
+          <div>
+            <h2 style={{ ...tituloCardDarkStyle, fontSize: 18 }}>Projetos</h2>
+            <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>
+              Abra um projeto para acessar a página dedicada dele.
+            </div>
+          </div>
+          <span style={{ color: "#94a3b8", fontSize: 12 }}>
+            {filtrados.length} projeto(s)
+          </span>
         </div>
-      ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table
-            style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}
-          >
-            <thead>
-              <tr>
-                {[
-                  "ID",
-                  "Projeto",
-                  "Tipo",
-                  "Gênero",
-                  "Prioridade",
-                  "Status",
-                  "Líder",
-                  "Editor",
-                ].map((h) => (
-                  <th key={h} style={tabelaHeaderDarkStyle}>
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtrados.slice(0, 35).map((p) => {
-                const statusCor = corStatus(p.Status);
-                const ativo = p.ID === projetoPainel?.ID;
+
+        {filtrados.length ? (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: isMobile
+                  ? "1fr"
+                  : isTablet
+                  ? "repeat(2, minmax(0, 1fr))"
+                  : "repeat(4, minmax(0, 1fr))",
+                gap: 14,
+                paddingTop: 14,
+              }}
+            >
+              {projetosPaginados.map((p) => {
+                const status = estiloStatusProjeto(p.Status);
+                const resumo = limparResumoProjeto(p.Observacoes);
+                const semanaAtualProjeto = obterNumeroSemanaProjeto(p);
+                const liderProjeto = obterNomeLiderProjeto(p);
+                const categoriaProjeto = extrairCategoriaProjeto(p.Observacoes);
+
                 return (
-                  <tr
+                  <button
                     key={p.ID}
-                    onClick={() => setSelecionadoId(p.ID)}
+                    type="button"
+                    onClick={() => abrirPaginaProjeto(p.ID)}
+                    aria-label={`Abrir página do projeto ${p.Projeto || p.ID}`}
                     style={{
+                      minWidth: 0,
+                      padding: 0,
+                      overflow: "hidden",
+                      border: "1px solid rgba(96,165,250,.24)",
+                      borderRadius: 20,
+                      color: "#f8fafc",
+                      background:
+                        "linear-gradient(180deg, rgba(9,23,49,.98), rgba(5,15,36,1))",
+                      textAlign: "left",
                       cursor: "pointer",
-                      background: ativo
-                        ? "rgba(37,99,235,0.18)"
-                        : "transparent",
-                      borderBottom: "1px solid rgba(148,163,184,0.10)",
+                      boxShadow: "0 16px 36px rgba(0,0,0,.22)",
+                      display: "flex",
+                      flexDirection: "column",
+                      minHeight: isMobile ? 320 : 330,
+                      transition: "transform .18s ease, box-shadow .18s ease, border-color .18s ease",
                     }}
                   >
-                    <td style={tabelaCellDarkStyle}>{p.ID}</td>
-                    <td
+                    <div
                       style={{
-                        ...tabelaCellDarkStyle,
-                        fontWeight: 800,
-                        color: "#f8fafc",
+                        width: "100%",
+                        height: isMobile ? 138 : 124,
+                        position: "relative",
+                        overflow: "hidden",
+                        display: "grid",
+                        placeItems: "center",
+                        background: p.Capa_URL
+                          ? "#0b1730"
+                          : "linear-gradient(135deg,#173f86 0%,#0d2f65 45%,#0a1f45 100%)",
+                        borderBottom: "1px solid rgba(96,165,250,.14)",
                       }}
                     >
-                      {p.Projeto}
+                      {p.Capa_URL ? (
+                        <img
+                          src={p.Capa_URL}
+                          alt={`Capa de ${p.Projeto || "projeto"}`}
+                          loading="lazy"
+                          style={{
+                            width: "100%",
+                            height: "100%",
+                            objectFit: "cover",
+                            display: "block",
+                          }}
+                        />
+                      ) : (
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            fontSize: 34,
+                            filter: "drop-shadow(0 7px 18px rgba(0,0,0,.28))",
+                          }}
+                        >
+                          🎬
+                        </span>
+                      )}
+
                       <div
                         style={{
-                          color: "#94a3b8",
-                          fontWeight: 500,
-                          fontSize: 12,
+                          position: "absolute",
+                          inset: 0,
+                          background: "linear-gradient(180deg, rgba(8,15,32,.08) 0%, rgba(7,15,34,.18) 45%, rgba(4,11,28,.66) 100%)",
                         }}
-                      >
-                        {p.Elenco.length} registro(s) de elenco
-                      </div>
-                    </td>
-                    <td style={tabelaCellDarkStyle}>{p.Tipo || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>{p.Genero || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>{p.Prioridade || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>
+                      />
+
                       <span
                         style={{
-                          background: statusCor.bg,
-                          color: statusCor.color,
-                          border: "1px solid rgba(148,163,184,0.12)",
-                          padding: "6px 10px",
-                          borderRadius: 10,
-                          fontWeight: 800,
-                          fontSize: 12,
+                          position: "absolute",
+                          top: 12,
+                          left: 12,
+                          background: status.background,
+                          color: status.color,
+                          border: `1px solid ${status.border}`,
+                          borderRadius: 999,
+                          padding: "5px 10px",
+                          fontSize: 10,
+                          lineHeight: 1,
+                          fontWeight: 900,
+                          whiteSpace: "nowrap",
+                          boxShadow: "0 8px 18px rgba(2,6,23,.18)",
                         }}
                       >
-                        {p.Status || "Sem status"}
+                        {normalizarStatusProjetoUI(p.Status)}
                       </span>
-                    </td>
-                    <td style={tabelaCellDarkStyle}>{p.Lider || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>{p.Editor || "-"}</td>
-                  </tr>
+
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: 12,
+                          right: 12,
+                          color: "#dbe7ff",
+                          background: "rgba(4,11,28,.58)",
+                          border: "1px solid rgba(148,163,184,.14)",
+                          borderRadius: 999,
+                          padding: "4px 8px",
+                          fontSize: 10,
+                          fontWeight: 900,
+                          backdropFilter: "blur(8px)",
+                        }}
+                      >
+                        #{p.ID}
+                      </span>
+                    </div>
+
+                    <div
+                      style={{
+                        padding: isMobile ? "12px 12px 13px" : "13px 14px 14px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 10,
+                        flex: 1,
+                        minWidth: 0,
+                      }}
+                    >
+                      <strong
+                        style={{
+                          fontSize: isMobile ? 16.5 : 16,
+                          lineHeight: 1.22,
+                          color: "#f8fafc",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          minHeight: isMobile ? 40 : 38,
+                        }}
+                      >
+                        {p.Projeto || "Projeto sem nome"}
+                      </strong>
+
+                      <p
+                        style={{
+                          margin: 0,
+                          color: "#c7d3ea",
+                          fontSize: 12,
+                          lineHeight: 1.45,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                          minHeight: 34,
+                        }}
+                      >
+                        {resumo || "Sem descrição cadastrada para este projeto."}
+                      </p>
+
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <span
+                          className="dw-chip dw-chip-blue"
+                          style={{ fontSize: 10, padding: "4px 10px", borderRadius: 999 }}
+                        >
+                          {p.Tipo || "Projeto"}
+                        </span>
+                        {p.Genero && (
+                          <span
+                            className="dw-chip"
+                            style={{ fontSize: 10, padding: "4px 10px", borderRadius: 999 }}
+                          >
+                            {p.Genero}
+                          </span>
+                        )}
+                        {categoriaProjeto && (
+                          <span
+                            className="dw-chip"
+                            style={{
+                              fontSize: 10,
+                              padding: "4px 10px",
+                              borderRadius: 999,
+                              color: "#bae6fd",
+                              background: "rgba(14,165,233,.12)",
+                              border: "1px solid rgba(56,189,248,.18)",
+                            }}
+                          >
+                            {categoriaProjeto}
+                          </span>
+                        )}
+                        {p.Prioridade && (
+                          <span
+                            className="dw-chip"
+                            style={{
+                              fontSize: 10,
+                              padding: "4px 10px",
+                              borderRadius: 999,
+                              color: "#fde68a",
+                              background: "rgba(146,64,14,.28)",
+                              border: "1px solid rgba(245,158,11,.22)",
+                            }}
+                          >
+                            {p.Prioridade}
+                          </span>
+                        )}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: "auto",
+                          paddingTop: 10,
+                          borderTop: "1px solid rgba(148,163,184,.10)",
+                          display: "grid",
+                          gridTemplateColumns: isMobile ? "1fr" : "1.25fr .8fr",
+                          gap: 12,
+                          alignItems: "end",
+                          minWidth: 0,
+                        }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ color: "#7f93be", marginBottom: 4, fontSize: 10 }}>
+                            👤 Líder
+                          </div>
+                          <div
+                            style={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              color: "#f8fafc",
+                              fontSize: 13,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {liderProjeto}
+                          </div>
+                        </div>
+
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ color: "#7f93be", marginBottom: 4, fontSize: 10 }}>
+                            🗓 Semana
+                          </div>
+                          <div style={{ color: "#f8fafc", fontSize: 13, fontWeight: 700 }}>
+                            {labelSemana(semanaAtualProjeto)}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 4,
+                          borderRadius: 13,
+                          background: "linear-gradient(180deg, #4f8fff 0%, #2f6fe2 100%)",
+                          color: "#ffffff",
+                          fontWeight: 800,
+                          fontSize: 13,
+                          textAlign: "center",
+                          padding: "10px 12px",
+                          boxShadow: "0 10px 18px rgba(35,99,214,.22)",
+                        }}
+                      >
+                        Abrir projeto →
+                      </div>
+                    </div>
+                  </button>
                 );
               })}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
+            </div>
+
+            <div
+              style={{
+                marginTop: 16,
+                paddingTop: 14,
+                borderTop: "1px solid rgba(148,163,184,.10)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ color: "#64748b", fontSize: 11 }}>
+                Página {paginaProjetos} de {totalPaginasProjetos} • {projetosPorPagina} por página
+              </div>
+
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button
+                  type="button"
+                  disabled={paginaProjetos === 1}
+                  onClick={() => {
+                    setPaginaProjetos((atual) => Math.max(1, atual - 1));
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  }}
+                  style={{
+                    ...botaoSecundarioStyle,
+                    padding: "8px 11px",
+                    minWidth: 36,
+                    opacity: paginaProjetos === 1 ? .45 : 1,
+                  }}
+                >
+                  ‹
+                </button>
+
+                {paginaInicial > 1 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setPaginaProjetos(1)}
+                      style={{ ...botaoSecundarioStyle, padding: "8px 11px", minWidth: 36 }}
+                    >
+                      1
+                    </button>
+                    {paginaInicial > 2 && <span style={{ color: "#64748b" }}>…</span>}
+                  </>
+                )}
+
+                {paginasVisiveis.map((pagina) => (
+                  <button
+                    key={pagina}
+                    type="button"
+                    onClick={() => setPaginaProjetos(pagina)}
+                    style={{
+                      ...(pagina === paginaProjetos
+                        ? botaoPrimarioStyle
+                        : botaoSecundarioStyle),
+                      padding: "8px 11px",
+                      minWidth: 36,
+                    }}
+                  >
+                    {pagina}
+                  </button>
+                ))}
+
+                {paginaFinal < totalPaginasProjetos && (
+                  <>
+                    {paginaFinal < totalPaginasProjetos - 1 && (
+                      <span style={{ color: "#64748b" }}>…</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setPaginaProjetos(totalPaginasProjetos)}
+                      style={{ ...botaoSecundarioStyle, padding: "8px 11px", minWidth: 36 }}
+                    >
+                      {totalPaginasProjetos}
+                    </button>
+                  </>
+                )}
+
+                <button
+                  type="button"
+                  disabled={paginaProjetos === totalPaginasProjetos}
+                  onClick={() => {
+                    setPaginaProjetos((atual) =>
+                      Math.min(totalPaginasProjetos, atual + 1)
+                    );
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  }}
+                  style={{
+                    ...botaoSecundarioStyle,
+                    padding: "8px 11px",
+                    minWidth: 36,
+                    opacity: paginaProjetos === totalPaginasProjetos ? .45 : 1,
+                  }}
+                >
+                  ›
+                </button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div
+            style={{
+              padding: "42px 14px 28px",
+              color: "#94a3b8",
+              textAlign: "center",
+            }}
+          >
+            Nenhum projeto encontrado com esses filtros.
+          </div>
+        )}
+      </section>
+    );
+  };
 
   const ProjectDetails = () => {
     if (!projetoPainel) {
@@ -6334,14 +9002,10 @@ export default function DubworksManager() {
             </div>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               <button
-                onClick={() => {
-                  setSelecionadoId(null);
-                  setRascunho(null);
-                  setAbaProjeto("informacoes");
-                }}
+                onClick={voltarParaListaProjetos}
                 style={botaoSecundarioStyle}
               >
-                Fechar projeto
+                ← Voltar aos projetos
               </button>
               {!rascunho || rascunho.ID !== projetoPainel.ID ? (
                 <>
@@ -6385,55 +9049,116 @@ export default function DubworksManager() {
                 ["Gênero", "Genero"],
                 ["Prioridade", "Prioridade"],
                 ["Status", "Status"],
-                ["Líder", "Lider"],
-                ["Editor", "Editor"],
+                ["Nome do líder", "__nome_lider"],
+                ["E-mail do líder", "Lider"],
+                ["Telefone do líder", "Telefone_Lider"],
+                ["Nome do editor", "__nome_editor"],
+                ["E-mail do editor", "Editor"],
+                ["Telefone do editor", "Telefone_Editor"],
                 ["Data de início", "Data_Inicio"],
-                ["Capa do projeto (URL)", "Capa_URL"],
+                ["Capa do projeto", "Capa_URL"],
               ].map(([label, campo]) =>
                 campo === "Capa_URL" ? (
-                  <div key={campo}>
+                  <div
+                    key={campo}
+                    style={{ gridColumn: isMobile ? "auto" : "1 / -1" }}
+                  >
                     <label style={labelStyle}>{label}</label>
 
                     <div
                       style={{
                         display: "grid",
-                        gap: 10,
+                        gap: 12,
                         background: "rgba(2, 6, 23, 0.42)",
-                        border: "1px solid rgba(56, 189, 248, 0.16)",
+                        border: "1px solid rgba(56, 189, 248, 0.18)",
                         borderRadius: 16,
                         padding: isMobile ? 12 : 14,
-                        overflow: "visible",
+                        overflow: "hidden",
                       }}
                     >
-                      {String((rascunho as any)[campo] || "").trim() ? (
+                      <label
+                        htmlFor={`capa-projeto-${projetoPainel.ID}`}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = "copy";
+                        }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          const arquivo = e.dataTransfer.files?.[0] || null;
+                          if (arquivo && arquivo.type.startsWith("image/")) {
+                            void enviarCapaRascunho(arquivo);
+                          } else if (arquivo) {
+                            alert("Selecione um arquivo de imagem.");
+                          }
+                        }}
+                        style={{
+                          width: "100%",
+                          minHeight: isMobile ? 170 : 220,
+                          borderRadius: 14,
+                          overflow: "hidden",
+                          border: "1px dashed rgba(96,165,250,.42)",
+                          background: String((rascunho as any)[campo] || "").trim()
+                            ? `linear-gradient(rgba(2,6,23,.08), rgba(2,6,23,.42)), url(${String((rascunho as any)[campo] || "")}) center/cover`
+                            : "linear-gradient(135deg, rgba(15,34,70,.88), rgba(8,20,45,.92))",
+                          color: "#a9b9d6",
+                          display: "grid",
+                          placeItems: "center",
+                          textAlign: "center",
+                          padding: 18,
+                          cursor: enviandoCapaProjeto ? "wait" : "pointer",
+                          boxSizing: "border-box",
+                          position: "relative",
+                        }}
+                      >
                         <div
                           style={{
-                            height: isMobile ? 150 : 180,
-                            borderRadius: 14,
-                            overflow: "hidden",
-                            border: "1px solid rgba(148, 163, 184, 0.16)",
-                            background: `linear-gradient(rgba(2,6,23,0.18), rgba(2,6,23,0.58)), url(${String(
-                              (rascunho as any)[campo] || ""
-                            )}) center/cover`,
-                          }}
-                        />
-                      ) : (
-                        <div
-                          style={{
-                            height: isMobile ? 120 : 150,
-                            borderRadius: 14,
-                            border: "1px dashed rgba(148, 163, 184, 0.28)",
-                            background: "rgba(15, 23, 42, 0.55)",
-                            color: "#94a3b8",
                             display: "grid",
-                            placeItems: "center",
-                            textAlign: "center",
-                            padding: 16,
+                            justifyItems: "center",
+                            gap: 8,
+                            padding: "12px 18px",
+                            borderRadius: 14,
+                            background: String((rascunho as any)[campo] || "").trim()
+                              ? "rgba(2,6,23,.56)"
+                              : "transparent",
+                            backdropFilter: String((rascunho as any)[campo] || "").trim()
+                              ? "blur(6px)"
+                              : undefined,
                           }}
                         >
-                          Cole o link da imagem da capa aqui embaixo.
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              fontSize: isMobile ? 34 : 42,
+                              lineHeight: 1,
+                              color: "#60a5fa",
+                              filter: "drop-shadow(0 8px 18px rgba(37,99,235,.24))",
+                            }}
+                          >
+                            ☁️
+                          </span>
+                          <strong style={{ color: "#dbeafe", fontSize: isMobile ? 14 : 16 }}>
+                            {enviandoCapaProjeto
+                              ? "Enviando imagem..."
+                              : "Envie uma imagem ou cole a URL da capa aqui."}
+                          </strong>
+                          <span style={{ color: "#94a3b8", fontSize: 12 }}>
+                            Arraste e solte ou clique para selecionar.
+                          </span>
                         </div>
-                      )}
+
+                        <input
+                          id={`capa-projeto-${projetoPainel.ID}`}
+                          type="file"
+                          accept="image/*"
+                          disabled={enviandoCapaProjeto}
+                          onChange={(e) => {
+                            const arquivo = e.target.files?.[0] || null;
+                            void enviarCapaRascunho(arquivo);
+                            e.currentTarget.value = "";
+                          }}
+                          style={{ display: "none" }}
+                        />
+                      </label>
 
                       <input
                         value={String((rascunho as any)[campo] || "")}
@@ -6445,25 +9170,31 @@ export default function DubworksManager() {
                         autoComplete="off"
                         style={{
                           ...inputStyle,
+                          width: "100%",
                           minHeight: isMobile ? 48 : inputStyle.minHeight,
                         }}
                       />
 
                       <div
                         style={{
-                          display: "flex",
+                          display: "grid",
+                          gridTemplateColumns: isMobile
+                            ? "1fr"
+                            : "repeat(3, minmax(0, 1fr))",
                           gap: 10,
-                          flexWrap: "wrap",
-                          alignItems: "center",
+                          alignItems: "stretch",
                         }}
                       >
                         <button
                           type="button"
-                          style={botaoSecundarioStyle}
+                          style={{
+                            ...botaoPrimarioStyle,
+                            width: "100%",
+                            minHeight: 48,
+                          }}
                           onClick={async () => {
                             try {
-                              const texto =
-                                await navigator.clipboard.readText();
+                              const texto = await navigator.clipboard.readText();
                               if (!texto.trim()) {
                                 alert("Não encontrei nenhum link copiado.");
                                 return;
@@ -6476,21 +9207,45 @@ export default function DubworksManager() {
                             }
                           }}
                         >
-                          Colar link da capa
+                          🔗 Colar link da capa
                         </button>
+
+                        <label
+                          htmlFor={`capa-projeto-${projetoPainel.ID}`}
+                          style={{
+                            ...botaoSecundarioStyle,
+                            width: "100%",
+                            minHeight: 48,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            cursor: enviandoCapaProjeto ? "wait" : "pointer",
+                            opacity: enviandoCapaProjeto ? 0.7 : 1,
+                            boxSizing: "border-box",
+                          }}
+                        >
+                          ⤴ {enviandoCapaProjeto ? "Enviando capa..." : "Enviar arquivo"}
+                        </label>
 
                         <button
                           type="button"
-                          style={botaoSecundarioStyle}
+                          style={{
+                            ...botaoSecundarioStyle,
+                            width: "100%",
+                            minHeight: 48,
+                            color: "#fb7185",
+                            borderColor: "rgba(244,63,94,.36)",
+                            background: "rgba(127,29,29,.12)",
+                          }}
                           onClick={() => atualizarCampo("Capa_URL", "")}
                         >
-                          Remover capa
+                          🗑 Remover capa
                         </button>
                       </div>
 
                       <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                        No celular, copie o link da imagem e toque em “Colar
-                        link da capa”. Depois clique em “Salvar alterações”.
+                        Você pode enviar uma imagem diretamente ou colar a URL.
+                        Depois clique em “Salvar alterações”.
                       </div>
                     </div>
                   </div>
@@ -6525,17 +9280,88 @@ export default function DubworksManager() {
                           </option>
                         ))}
                       </select>
-                    ) : (
+                    ) : campo === "__nome_lider" || campo === "__nome_editor" ? (
                       <input
-                        value={String((rascunho as any)[campo] || "")}
+                        value={
+                          campo === "__nome_lider"
+                            ? extrairNomesResponsaveisProjeto(rascunho.Observacoes).lider
+                            : extrairNomesResponsaveisProjeto(rascunho.Observacoes).editor
+                        }
                         onChange={(e) =>
-                          atualizarCampo(
-                            campo as keyof Projeto,
+                          atualizarNomeResponsavelRascunho(
+                            campo === "__nome_lider" ? "lider" : "editor",
                             e.target.value
                           )
                         }
+                        placeholder={campo === "__nome_lider" ? "Nome do líder" : "Nome do editor"}
                         style={inputStyle}
                       />
+                    ) : campo === "Data_Inicio" ? (
+                      <input
+                        type="date"
+                        value={valorDataParaInput(rascunho.Data_Inicio)}
+                        onChange={(e) => atualizarCampo("Data_Inicio", e.target.value)}
+                        style={inputStyle}
+                      />
+                    ) : (
+                      <>
+                        <input
+                          value={String((rascunho as any)[campo] || "")}
+                          onChange={(e) => {
+                            atualizarCampo(campo as keyof Projeto, e.target.value);
+                            if (campo === "Lider") setErroEmailLiderEdicao("");
+                            if (campo === "Editor") setErroEmailEditorEdicao("");
+                          }}
+                          onBlur={() => {
+                            if ((campo === "Lider" || campo === "Editor") && String((rascunho as any)[campo] || "").trim()) {
+                              void localizarUsuarioPorEmailProjeto(String((rascunho as any)[campo] || "")).then((perfil) => {
+                                const mensagem = perfil
+                                  ? ""
+                                  : "Este e-mail não está cadastrado nos usuários do DubWorks Manager.";
+                                if (campo === "Lider") setErroEmailLiderEdicao(mensagem);
+                                if (campo === "Editor") setErroEmailEditorEdicao(mensagem);
+                              });
+                            }
+                          }}
+                          placeholder={
+                            campo === "Lider"
+                              ? "E-mail do líder"
+                              : campo === "Editor"
+                              ? "E-mail do editor"
+                              : campo === "Telefone_Lider" || campo === "Telefone_Editor"
+                              ? "[00] 00000-0000"
+                              : campo === "Projeto"
+                              ? "Nome do projeto"
+                              : ""
+                          }
+                          inputMode={
+                            campo === "Lider" || campo === "Editor"
+                              ? "email"
+                              : campo === "Telefone_Lider" || campo === "Telefone_Editor"
+                              ? "tel"
+                              : undefined
+                          }
+                          style={{
+                            ...inputStyle,
+                            borderColor:
+                              campo === "Lider" && erroEmailLiderEdicao
+                                ? "rgba(248,113,113,.72)"
+                                : campo === "Editor" && erroEmailEditorEdicao
+                                ? "rgba(248,113,113,.72)"
+                                : inputStyle.borderColor,
+                          }}
+                        />
+                        {campo === "Lider" && erroEmailLiderEdicao && (
+                          <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                            {erroEmailLiderEdicao}
+                          </div>
+                        )}
+                        {campo === "Editor" && erroEmailEditorEdicao && (
+                          <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                            {erroEmailEditorEdicao}
+                          </div>
+                        )}
+                      </>
                     )}
                   </div>
                 )
@@ -6556,8 +9382,12 @@ export default function DubworksManager() {
                 ["Tipo", projetoPainel.Tipo],
                 ["Gênero", projetoPainel.Genero],
                 ["Prioridade", projetoPainel.Prioridade],
-                ["Líder", projetoPainel.Lider],
-                ["Editor", projetoPainel.Editor],
+                ["Nome do líder", extrairNomesResponsaveisProjeto(projetoPainel.Observacoes).lider],
+                ["E-mail do líder", projetoPainel.Lider],
+                ["Telefone do líder", projetoPainel.Telefone_Lider],
+                ["Nome do editor", extrairNomesResponsaveisProjeto(projetoPainel.Observacoes).editor],
+                ["E-mail do editor", projetoPainel.Editor],
+                ["Telefone do editor", projetoPainel.Telefone_Editor],
                 ["Data de início", formatarDataBR(projetoPainel.Data_Inicio)],
               ].map(([label, value]) => (
                 <div key={label}>
@@ -6616,8 +9446,7 @@ export default function DubworksManager() {
             <span>📁</span> Arquivos do Drive
           </h2>
           <p style={{ color: "#94a3b8", margin: "8px 0 0" }}>
-            Crie a estrutura oficial no Google Drive ou cole os links
-            manualmente. Estrutura: 1 | Seleção, 2 | Projeto e 3 | Finalizado.
+            Crie as pastas oficiais do projeto no Google Drive ou salve os links manualmente.
           </p>
         </div>
 
@@ -6645,6 +9474,21 @@ export default function DubworksManager() {
             </button>
 
             <button
+              onClick={prepararOuAtualizarFormulariosProjeto}
+              disabled={preparandoFormulariosProjeto}
+              style={{
+                ...botaoSecundarioStyle,
+                opacity: preparandoFormulariosProjeto ? 0.65 : 1,
+                cursor: preparandoFormulariosProjeto ? "not-allowed" : "pointer",
+              }}
+              title="Cria ou atualiza os Forms sem recriar as pastas do Drive"
+            >
+              {preparandoFormulariosProjeto
+                ? "Atualizando formulários..."
+                : "Criar/atualizar formulários"}
+            </button>
+
+            <button
               onClick={salvarLinksDriveComHistorico}
               style={botaoSecundarioStyle}
             >
@@ -6652,25 +9496,6 @@ export default function DubworksManager() {
             </button>
           </div>
         )}
-      </div>
-
-      <div
-        style={{
-          padding: 16,
-          borderRadius: 16,
-          border: "1px solid rgba(56,189,248,.25)",
-          background: "rgba(14,165,233,.08)",
-          color: "#cbd5e1",
-          marginBottom: 16,
-        }}
-      >
-        <strong style={{ color: "#f8fafc" }}>
-          Integração Google Drive — Beta
-        </strong>
-        <br />O botão cria a pasta principal do projeto e as subpastas oficiais:
-        <strong> 1 | Seleção</strong>, <strong>2 | Projeto</strong> e{" "}
-        <strong>3 | Finalizado</strong>. Se a função do Supabase ainda não
-        estiver configurada, o app apenas avisará sem quebrar o sistema.
       </div>
 
       <div style={{ display: "grid", gap: 16 }}>
@@ -7554,390 +10379,1865 @@ export default function DubworksManager() {
     );
   };
 
-  const MembersPage = () => (
-    <div style={{ display: "grid", gap: 18 }}>
-      <div style={pageHeaderDarkStyle}>
-        <div>
-          <div style={breadcrumbDarkStyle}>
-            {usuarioLogado?.cargo === "analista_rr" ? "Recepção e Remoção" : "Membros"}
-          </div>
-          <h1 style={pageTitleDarkStyle}>
-            {usuarioLogado?.cargo === "analista_rr"
-              ? "Central de RR"
-              : "Central de Membros"}
-          </h1>
-        </div>
-        <button
-          onClick={async () => {
-            await recarregarMembros();
-            alert("Membros atualizados.");
+  const MembersPage = () => {
+    const formatarSomenteDataHistorico = (valor?: string | null) => {
+      if (!valor) return "-";
+      const data = new Date(valor);
+      if (Number.isNaN(data.getTime())) return valor;
+      return data.toLocaleDateString("pt-BR", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+      });
+    };
+
+    const paletaStatusMembroTag = (status: StatusMembro) => {
+      switch (status) {
+        case "na_comunidade":
+          return { bg: "rgba(59,130,246,0.30)", color: "#bfdbfe", border: "rgba(96,165,250,0.42)" };
+        case "somente_canais":
+          return { bg: "rgba(125,211,252,0.24)", color: "#bae6fd", border: "rgba(125,211,252,0.34)" };
+        case "saiu":
+          return { bg: "rgba(248,113,113,0.26)", color: "#fecaca", border: "rgba(248,113,113,0.38)" };
+        case "banido":
+          return { bg: "rgba(239,68,68,0.34)", color: "#fecaca", border: "rgba(239,68,68,0.44)" };
+        case "pausado":
+          return { bg: "rgba(234,179,8,0.30)", color: "#fde68a", border: "rgba(250,204,21,0.34)" };
+        default:
+          return { bg: "rgba(100,116,139,0.28)", color: "#e2e8f0", border: "rgba(148,163,184,0.32)" };
+      }
+    };
+
+    const paletaAtendimentoMembroTag = (atendimento?: AtendimentoMembro | string) => {
+      const valor = String(atendimento || "chamar").toLowerCase();
+      if (valor === "01" || valor === "1") {
+        return { bg: "rgba(253,230,138,0.24)", color: "#fde68a", border: "rgba(253,230,138,0.34)" };
+      }
+      if (valor === "02" || valor === "2") {
+        return { bg: "rgba(254,240,138,0.18)", color: "#fef3c7", border: "rgba(254,240,138,0.30)" };
+      }
+      if (valor === "concluido") {
+        return { bg: "rgba(34,197,94,0.34)", color: "#86efac", border: "rgba(34,197,94,0.45)" };
+      }
+      if (valor === "erro") {
+        return { bg: "rgba(239,68,68,0.34)", color: "#fca5a5", border: "rgba(239,68,68,0.44)" };
+      }
+      if (valor === "fila" || valor === "na_fila") {
+        return { bg: "rgba(14,165,233,0.34)", color: "#7dd3fc", border: "rgba(14,165,233,0.40)" };
+      }
+      return { bg: "rgba(245,158,11,0.34)", color: "#fcd34d", border: "rgba(245,158,11,0.40)" };
+    };
+
+    const estiloSelectStatus = (
+      bg: string,
+      color: string,
+      borderColor?: string
+    ): React.CSSProperties => ({
+      backgroundColor: bg,
+      color,
+      border: `1px solid ${borderColor || `${color}55`}`,
+      borderRadius: 999,
+      padding: "8px 12px",
+      fontWeight: 900,
+      fontSize: 12,
+      lineHeight: 1.1,
+      minWidth: 148,
+      outline: "none",
+      cursor: "pointer",
+      boxShadow: `inset 0 1px 0 rgba(255,255,255,0.05), 0 0 0 1px rgba(15,23,42,0.16)`,
+    });
+
+    const descricaoEventoMembro = (evento: HistoricoMembroEvento) => {
+      const novo = normalizar(`${evento.valor_novo || ""} ${evento.titulo || ""}`);
+      const anterior = normalizar(evento.valor_anterior || "");
+
+      if (evento.tipo === "participacao") {
+        if (novo.includes("ban")) return "Foi banido da comunidade";
+        if (novo.includes("sai")) return "Saiu da comunidade";
+        if (novo.includes("paus")) return "Participação pausada";
+        if (novo.includes("canal")) return "Passou a participar apenas pelos canais";
+        if (novo.includes("comunidade") || novo.includes("na comunidade")) {
+          if (
+            anterior.includes("sai") ||
+            anterior.includes("ban") ||
+            anterior.includes("canal") ||
+            anterior.includes("paus")
+          ) {
+            return "Retornou para a comunidade";
+          }
+          return "Entrou na comunidade";
+        }
+      }
+
+      if (evento.tipo === "atendimento") {
+        const valorNovo = normalizar(evento.valor_novo || "");
+        if (valorNovo === "1" || valorNovo === "01") return "Atendimento avançou para 1";
+        if (valorNovo === "2" || valorNovo === "02") return "Atendimento avançou para 2";
+        if (valorNovo.includes("conclu")) return "Atendimento concluído";
+        if (valorNovo.includes("erro")) return "Atendimento marcado com erro";
+        if (valorNovo.includes("chamar")) return "Marcado para chamar";
+      }
+
+      return evento.titulo || "Atividade registrada";
+    };
+
+    const corEventoMembro = (evento: HistoricoMembroEvento) => {
+      const texto = normalizar(`${evento.valor_novo || ""} ${evento.titulo || ""}`);
+      if (texto.includes("ban")) return "#fb7185";
+      if (texto.includes("sai")) return "#f87171";
+      if (texto.includes("canal")) return "#38bdf8";
+      if (evento.tipo === "atendimento") return "#fbbf24";
+      return "#34d399";
+    };
+
+    const renderDetalhesMembro = (membro: Membro) => {
+      const editando = membroEmEdicaoId === membro.id && Boolean(rascunhoMembroEdicao);
+      const rascunho = editando ? rascunhoMembroEdicao! : membro;
+      const eventosAtividade = [...historicoMembroSelecionado]
+        .filter((evento) =>
+          ["ficha", "atendimento", "participacao", "edicao", "observacao", "movimentacao"].includes(
+            evento.tipo
+          )
+        )
+        .sort((a, b) => String(a.data || "").localeCompare(String(b.data || "")))
+        .slice(-80);
+
+      const entradasRegistradas = historicoMembroSelecionado.filter((evento) => {
+        if (evento.tipo !== "participacao") return false;
+        const novo = normalizar(`${evento.valor_novo || ""} ${evento.titulo || ""}`);
+        return novo.includes("comunidade") && !novo.includes("sai");
+      }).length;
+      const saidasRegistradas = historicoMembroSelecionado.filter((evento) => {
+        if (evento.tipo !== "participacao") return false;
+        return normalizar(`${evento.valor_novo || ""} ${evento.titulo || ""}`).includes("sai");
+      }).length;
+      const foiBanido =
+        membro.status === "banido" ||
+        historicoMembroSelecionado.some((evento) =>
+          normalizar(`${evento.valor_novo || ""} ${evento.titulo || ""}`).includes("ban")
+        );
+
+      const telefoneNumerico = String(membro.telefone || "").replace(/\D/g, "");
+      const telefoneWhatsApp = telefoneNumerico.length >= 12
+        ? telefoneNumerico
+        : telefoneNumerico.length >= 10
+        ? `55${telefoneNumerico}`
+        : "";
+      const whatsappPronto = whatsappBridge.state === "pronto";
+      const templateWhatsappAtual =
+        tipoMensagemWhatsapp === "01" ? mensagemWhatsapp01 : mensagemWhatsapp02;
+      const previewWhatsappAtual = aplicarTemplateWhatsapp(
+        templateWhatsappAtual,
+        membro
+      );
+
+      const infoLinha = (
+        label: string,
+        valor: React.ReactNode,
+        ultimo = false
+      ) => (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(105px,.8fr) minmax(0,1.4fr)",
+            gap: 12,
+            padding: "10px 0",
+            borderBottom: ultimo ? "none" : "1px solid rgba(148,163,184,.10)",
           }}
-          style={botaoPrimarioStyle}
         >
-          Atualizar membros
-        </button>
-      </div>
+          <span style={{ color: "#94a3b8", fontSize: 12 }}>{label}</span>
+          <span style={{ color: "#e2e8f0", fontSize: 12, fontWeight: 750, minWidth: 0 }}>
+            {valor || "-"}
+          </span>
+        </div>
+      );
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: isMobile ? "1fr" : "repeat(4, 1fr)",
-          gap: 16,
-        }}
-      >
-        <MiniStat
-          icon="👥"
-          value={String(membros.length)}
-          label="Total de membros"
-          color="#38bdf8"
-        />
-        <MiniStat
-          icon="✅"
-          value={String(totalMembrosAtivos)}
-          label="Na comunidade"
-          color="#22c55e"
-        />
-        <MiniStat
-          icon="↪"
-          value={String(totalMembrosSaida)}
-          label="Saíram"
-          color="#f97316"
-        />
-        <MiniStat
-          icon="📈"
-          value={String(
-            relatorioEntradaSaida[relatorioEntradaSaida.length - 1]
-              ?.totalFinal || 0
-          )}
-          label="Crescimento"
-          color="#a78bfa"
-        />
-      </div>
+      return (
+        <div
+          style={{
+            margin: "8px 4px 18px",
+            border: "1px solid rgba(96,165,250,.28)",
+            borderRadius: 14,
+            background: "rgba(8,15,30,.96)",
+            boxShadow: "0 16px 38px rgba(0,0,0,.22)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              padding: "17px 18px 4px",
+            }}
+          >
+            <h3 style={{ margin: 0, color: "#f8fafc", fontSize: 20 }}>
+              {membro.nome || "Membro sem nome"}
+            </h3>
+          </div>
 
-      {membroSelecionado && (
+          <div
+            style={{
+              padding: 18,
+              display: "grid",
+              gridTemplateColumns: isMobile ? "1fr" : "minmax(280px,.72fr) minmax(0,1.45fr)",
+              gap: 14,
+              alignItems: "start",
+            }}
+          >
+            <div
+              style={{
+                border: "1px solid rgba(148,163,184,.12)",
+                borderRadius: 12,
+                background: "rgba(15,23,42,.48)",
+                padding: 14,
+              }}
+            >
+              {editando ? (
+                <>
+                  <div style={{ color: "#f8fafc", fontWeight: 900, fontSize: 14, marginBottom: 12 }}>
+                    ✎ Editar informações do membro
+                  </div>
+                  <div style={{ display: "grid", gap: 11 }}>
+                    <div>
+                      <label style={labelStyle}>Nome</label>
+                      <input
+                        value={String(rascunho.nome || "")}
+                        onChange={(e) => setRascunhoMembroEdicao((atual) => ({ ...(atual || {}), nome: e.target.value }))}
+                        style={inputStyle}
+                      />
+                    </div>
+                    <div>
+                      <label style={labelStyle}>Número / WhatsApp</label>
+                      <input
+                        value={String(rascunho.telefone || "")}
+                        onChange={(e) => setRascunhoMembroEdicao((atual) => ({ ...(atual || {}), telefone: e.target.value }))}
+                        style={inputStyle}
+                      />
+                    </div>
+                    <div>
+                      <label style={labelStyle}>Observação interna</label>
+                      <textarea
+                        value={String(rascunho.observacao || "")}
+                        onChange={(e) => setRascunhoMembroEdicao((atual) => ({ ...(atual || {}), observacao: e.target.value }))}
+                        placeholder="Adicione uma observação sobre este membro..."
+                        style={{ ...textareaStyle, minHeight: 90, marginTop: 6 }}
+                      />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 2 }}>
+                      <button
+                        type="button"
+                        onClick={cancelarEdicaoMembro}
+                        disabled={salvandoEdicaoMembro}
+                        style={botaoSecundarioStyle}
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => salvarEdicaoMembro(membro)}
+                        disabled={salvandoEdicaoMembro}
+                        style={{ ...botaoPrimarioStyle, opacity: salvandoEdicaoMembro ? .65 : 1 }}
+                      >
+                        {salvandoEdicaoMembro ? "Salvando..." : "Salvar alterações"}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ color: "#f8fafc", fontWeight: 900, fontSize: 14, marginBottom: 4 }}>
+                    👤 Informações principais
+                  </div>
+                  {infoLinha("Nome", membro.nome || "-")}
+                  {infoLinha("Telefone", membro.telefone || "-")}
+                  {infoLinha("Nascimento", formatarDataBR(membro.data_nascimento) || "-")}
+                  {infoLinha(
+                    "Idade",
+                    <span style={{ color: membro.idade_inconsistente ? "#fca5a5" : "#e2e8f0" }}>
+                      {membro.idade ?? "-"} anos
+                      {membro.idade_inconsistente ? "  ⚠ conferir faixa etária" : ""}
+                    </span>
+                  )}
+                  {infoLinha("Data da ficha", formatarSomenteDataHistorico(membro.data_ficha), true)}
+
+                  <div style={{ borderTop: "1px solid rgba(148,163,184,.12)", marginTop: 8, paddingTop: 12 }}>
+                    <div style={{ color: "#94a3b8", fontSize: 11, fontWeight: 800, textTransform: "uppercase" }}>
+                      Observação interna
+                    </div>
+                    <div style={{ color: membro.observacao ? "#cbd5e1" : "#64748b", fontSize: 12, lineHeight: 1.55, marginTop: 6, whiteSpace: "pre-wrap" }}>
+                      {membro.observacao || "Nenhuma observação registrada."}
+                    </div>
+                  </div>
+
+                  {(telefoneWhatsApp || podeGerenciarMembros(usuarioLogado)) && (
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns:
+                          telefoneWhatsApp && podeGerenciarMembros(usuarioLogado)
+                            ? "minmax(0,.8fr) minmax(0,1.15fr)"
+                            : "1fr",
+                        gap: 8,
+                        marginTop: 14,
+                      }}
+                    >
+                      {telefoneWhatsApp && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            window.open(
+                              `https://wa.me/${telefoneWhatsApp}`,
+                              "_blank",
+                              "noopener,noreferrer"
+                            )
+                          }
+                          style={{
+                            ...botaoSecundarioStyle,
+                            padding: "9px 10px",
+                            width: "100%",
+                            justifyContent: "center",
+                          }}
+                        >
+                          WhatsApp
+                        </button>
+                      )}
+                      {podeGerenciarMembros(usuarioLogado) && (
+                        <button
+                          type="button"
+                          onClick={() => iniciarEdicaoMembro(membro)}
+                          style={{
+                            ...botaoPrimarioStyle,
+                            padding: "9px 10px",
+                            width: "100%",
+                            justifyContent: "center",
+                          }}
+                        >
+                          ✎ Editar membro
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div style={{ display: "grid", gap: 10 }}>
+              {podeGerenciarMembros(usuarioLogado) && (
+                <div
+                  style={{
+                    border: "1px solid rgba(37,211,102,.20)",
+                    borderRadius: 12,
+                    background: "rgba(7,24,20,.48)",
+                    padding: 14,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: 10,
+                      alignItems: "flex-start",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div>
+                      <div style={{ color: "#f8fafc", fontWeight: 900, fontSize: 14 }}>
+                        💬 Chamada pelo WhatsApp
+                      </div>
+                      <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 3 }}>
+                        Envio manual integrado à ficha. Após enviar, o status vira 01 ou 02 automaticamente.
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span
+                        style={{
+                          padding: "5px 9px",
+                          borderRadius: 999,
+                          fontSize: 10,
+                          fontWeight: 900,
+                          background: whatsappPronto
+                            ? "rgba(34,197,94,.18)"
+                            : whatsappBridge.state === "qr"
+                            ? "rgba(245,158,11,.18)"
+                            : "rgba(239,68,68,.15)",
+                          color: whatsappPronto
+                            ? "#86efac"
+                            : whatsappBridge.state === "qr"
+                            ? "#fcd34d"
+                            : "#fca5a5",
+                        }}
+                      >
+                        {whatsappPronto
+                          ? "Conectado"
+                          : whatsappBridge.state === "qr"
+                          ? "Aguardando QR"
+                          : "Offline"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => carregarStatusWhatsappBridge(true)}
+                        disabled={carregandoWhatsappBridge}
+                        style={{ ...botaoSecundarioStyle, padding: "6px 9px", fontSize: 11 }}
+                      >
+                        {carregandoWhatsappBridge ? "..." : "↻"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 9 }}>
+                    {whatsappBridge.detail}
+                    {whatsappBridge.numero ? ` • ${whatsappBridge.numero}` : ""}
+                  </div>
+
+                  {whatsappBridge.state === "qr" && whatsappBridge.qr_data_url && (
+                    <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                      <img
+                        src={whatsappBridge.qr_data_url}
+                        alt="QR Code do WhatsApp"
+                        style={{ width: 180, height: 180, borderRadius: 10, background: "white", padding: 6 }}
+                      />
+                      <div style={{ color: "#cbd5e1", fontSize: 12, maxWidth: 300, lineHeight: 1.55 }}>
+                        No celular: WhatsApp → Aparelhos conectados → Conectar um aparelho.
+                      </div>
+                    </div>
+                  )}
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: isMobile ? "1fr" : "210px minmax(0,1fr)",
+                      gap: 10,
+                      marginTop: 13,
+                    }}
+                  >
+                    <div>
+                      <label style={labelStyle}>Tipo de mensagem</label>
+                      <select
+                        value={tipoMensagemWhatsapp}
+                        onChange={(e) => setTipoMensagemWhatsapp(e.target.value as "01" | "02")}
+                        style={inputStyle}
+                      >
+                        <option value="01">01 — Confirmação da ficha</option>
+                        <option value="02">02 — Correção da ficha</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label style={labelStyle}>Prévia para {membro.nome || "o membro"}</label>
+                      <div
+                        style={{
+                          border: "1px solid rgba(148,163,184,.14)",
+                          borderRadius: 10,
+                          background: "rgba(2,6,23,.54)",
+                          color: "#dbeafe",
+                          padding: 11,
+                          minHeight: 86,
+                          maxHeight: 180,
+                          overflowY: "auto",
+                          whiteSpace: "pre-wrap",
+                          fontSize: 12,
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        {previewWhatsappAtual}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+                    <button
+                      type="button"
+                      onClick={() => enviarChamadaWhatsapp(membro)}
+                      disabled={!whatsappPronto || enviandoWhatsappMembroId === membro.id || !membro.telefone}
+                      style={{
+                        ...botaoPrimarioStyle,
+                        opacity:
+                          !whatsappPronto || enviandoWhatsappMembroId === membro.id || !membro.telefone
+                            ? 0.55
+                            : 1,
+                      }}
+                    >
+                      {enviandoWhatsappMembroId === membro.id
+                        ? "Enviando..."
+                        : `Enviar ${tipoMensagemWhatsapp} pelo WhatsApp`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMostrarConfigMensagensWhatsapp((valor) => !valor)}
+                      style={botaoSecundarioStyle}
+                    >
+                      {mostrarConfigMensagensWhatsapp ? "Fechar mensagens-base" : "Editar mensagens-base"}
+                    </button>
+                  </div>
+
+                  {mostrarConfigMensagensWhatsapp && (
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: isMobile ? "1fr" : "repeat(2,minmax(0,1fr))",
+                        gap: 10,
+                        marginTop: 12,
+                        paddingTop: 12,
+                        borderTop: "1px solid rgba(148,163,184,.12)",
+                      }}
+                    >
+                      <div>
+                        <label style={labelStyle}>Mensagem 01 — confirmação</label>
+                        <textarea
+                          value={mensagemWhatsapp01}
+                          onChange={(e) => setMensagemWhatsapp01(e.target.value)}
+                          style={{ ...textareaStyle, minHeight: 170 }}
+                        />
+                      </div>
+                      <div>
+                        <label style={labelStyle}>Mensagem 02 — correção da ficha</label>
+                        <textarea
+                          value={mensagemWhatsapp02}
+                          onChange={(e) => setMensagemWhatsapp02(e.target.value)}
+                          style={{ ...textareaStyle, minHeight: 170 }}
+                        />
+                      </div>
+                      <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                        <span style={{ color: "#64748b", fontSize: 11 }}>
+                          Campos disponíveis: {`{nome}`}, {`{responsavel}`} e {`{cargo}`}.
+                        </span>
+                        <button type="button" onClick={salvarMensagensBaseWhatsapp} style={botaoPrimarioStyle}>
+                          Salvar mensagens-base
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div
+                style={{
+                  border: "1px solid rgba(148,163,184,.12)",
+                  borderRadius: 12,
+                  background: "rgba(15,23,42,.48)",
+                  padding: 14,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ color: "#f8fafc", fontWeight: 900, fontSize: 14 }}>
+                      ◷ Atividade do membro
+                    </div>
+                    <div style={{ color: "#64748b", fontSize: 11, marginTop: 3 }}>
+                      Alterações, entradas, saídas, banimentos e andamento do atendimento.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => membro.id && recarregarHistoricoMembro(membro.id)}
+                    style={{ ...botaoSecundarioStyle, padding: "6px 9px", fontSize: 11 }}
+                  >
+                    ↻ Atualizar
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: isMobile ? "1fr" : "repeat(3, minmax(0,1fr))",
+                    gap: 8,
+                    marginTop: 12,
+                  }}
+                >
+                  {[
+                    ["↩", String(entradasRegistradas), "Entradas registradas", "#34d399"],
+                    ["↪", String(saidasRegistradas), "Saídas registradas", "#f87171"],
+                    ["⛔", foiBanido ? "Sim" : "Não", "Banimento", foiBanido ? "#fb7185" : "#94a3b8"],
+                  ].map(([icone, valor, label, color]) => (
+                    <div
+                      key={String(label)}
+                      style={{
+                        border: "1px solid rgba(148,163,184,.10)",
+                        borderRadius: 10,
+                        padding: 10,
+                        background: "rgba(2,6,23,.36)",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                        <span style={{ color: String(color), fontSize: 15 }}>{icone}</span>
+                        <strong style={{ color: "#f8fafc", fontSize: 17 }}>{valor}</strong>
+                      </div>
+                      <div style={{ color: "#64748b", fontSize: 10, marginTop: 4 }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 12,
+                    border: "1px solid rgba(96,165,250,.16)",
+                    borderRadius: 10,
+                    background: "#050b16",
+                    minHeight: 188,
+                    maxHeight: 320,
+                    overflowY: "auto",
+                    padding: "10px 12px",
+                    fontFamily: 'Consolas, "SFMono-Regular", Menlo, monospace',
+                  }}
+                >
+                  {carregandoHistoricoMembro ? (
+                    <div style={{ color: "#64748b", fontSize: 12 }}>Carregando histórico...</div>
+                  ) : eventosAtividade.length ? (
+                    eventosAtividade.map((evento, idx) => (
+                      <div
+                        key={evento.id || `${evento.data}-${idx}`}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: isMobile ? "92px minmax(0,1fr)" : "104px minmax(0,1fr)",
+                          gap: 10,
+                          padding: "7px 2px",
+                          borderBottom: idx === eventosAtividade.length - 1 ? "none" : "1px solid rgba(148,163,184,.06)",
+                          lineHeight: 1.45,
+                        }}
+                      >
+                        <span style={{ color: corEventoMembro(evento), fontSize: 11, fontWeight: 800 }}>
+                          {formatarSomenteDataHistorico(evento.data)}
+                        </span>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ color: "#cbd5e1", fontSize: 11 }}>
+                            — {descricaoEventoMembro(evento)}
+                          </div>
+                          <div style={{ color: "#64748b", fontSize: 10, marginTop: 2 }}>
+                            por {evento.usuario || "Sistema"}
+                            {evento.cargo ? ` • ${evento.cargo}` : ""}
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ color: "#64748b", fontSize: 12, padding: "8px 2px" }}>
+                      Nenhuma movimentação registrada ainda.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    return (
+      <div style={{ display: "grid", gap: 18 }}>
+        <div style={pageHeaderDarkStyle}>
+          <div>
+            <div style={breadcrumbDarkStyle}>
+              {usuarioLogado?.cargo === "analista_rr"
+                ? "Recepção e Remoção"
+                : "Membros"}
+            </div>
+            <h1 style={pageTitleDarkStyle}>
+              {usuarioLogado?.cargo === "analista_rr"
+                ? "Central de RR"
+                : "Central de Membros"}
+            </h1>
+            <p style={{ color: "#94a3b8", margin: "7px 0 0" }}>
+              Dados sincronizados com a planilha do formulário da DubWorks.
+              {ultimaSincronizacaoMembros
+                ? ` Última sincronização: ${ultimaSincronizacaoMembros.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}.`
+                : " Sincronização automática ativa a cada 15 segundos."}
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {filaWhatsappAtiva ? (
+              <button
+                type="button"
+                onClick={pararFilaChamadasWhatsapp}
+                style={{ ...botaoSecundarioStyle, borderColor: "rgba(248,113,113,.45)", color: "#fecaca" }}
+              >
+                ■ Parar fila WhatsApp
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void iniciarFilaChamadasWhatsapp()}
+                disabled={totalAtendimentoPendente === 0}
+                style={{
+                  ...botaoPrimarioStyle,
+                  opacity: totalAtendimentoPendente === 0 ? 0.55 : 1,
+                  cursor: totalAtendimentoPendente === 0 ? "not-allowed" : "pointer",
+                }}
+                title="Chama automaticamente os membros marcados como Chamar, com intervalo aleatório de até 5 minutos."
+              >
+                ▶ Chamar pendentes ({totalAtendimentoPendente})
+              </button>
+            )}
+            <button
+              onClick={baixarBackupMembrosJSON}
+              style={botaoSecundarioStyle}
+              title="Baixa uma cópia local dos dados atualmente carregados na Central."
+            >
+              Baixar backup
+            </button>
+            <button
+              onClick={async () => {
+                await recarregarMembros(true);
+                if (membroSelecionadoId) {
+                  await recarregarHistoricoMembro(membroSelecionadoId);
+                }
+                alert("Membros sincronizados com a planilha.");
+              }}
+              style={botaoPrimarioStyle}
+            >
+              Sincronizar planilha
+            </button>
+          </div>
+        </div>
+
+        {(filaWhatsappAtiva || filaWhatsappResumo) && (
+          <div
+            style={{
+              ...painelDarkStyle,
+              border: "1px solid rgba(37,211,102,.25)",
+              background: "rgba(5,46,22,.18)",
+              display: "grid",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <strong style={{ color: "#bbf7d0" }}>💬 Fila de chamadas do WhatsApp</strong>
+              {filaWhatsappAtiva && (
+                <span style={{ color: "#94a3b8", fontSize: 12 }}>
+                  {filaWhatsappProcessados}/{filaWhatsappTotal} processados
+                </span>
+              )}
+            </div>
+            {filaWhatsappAtiva ? (
+              <>
+                <div style={{ color: "#e2e8f0", fontSize: 13 }}>{filaWhatsappAtual || "Preparando fila..."}</div>
+                {filaWhatsappProximoEm !== null && (
+                  <div style={{ color: "#86efac", fontSize: 12 }}>
+                    Próximo envio em {formatarEsperaFilaWhatsapp(filaWhatsappProximoEm)}
+                  </div>
+                )}
+                <div style={{ color: "#64748b", fontSize: 11 }}>
+                  Intervalo aleatório: 15 segundos a 5 minutos. A Mensagem 01 é usada para quem está em Chamar.
+                </div>
+              </>
+            ) : (
+              <div style={{ color: "#94a3b8", fontSize: 12 }}>{filaWhatsappResumo}</div>
+            )}
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: isMobile
+              ? "repeat(2, minmax(0,1fr))"
+              : "repeat(auto-fit, minmax(170px, 1fr))",
+            gap: 12,
+          }}
+        >
+          <MiniStat
+            icon="👥"
+            value={String(membros.length)}
+            label="Total de fichas"
+            color="#38bdf8"
+          />
+          <MiniStat
+            icon="✅"
+            value={String(totalMembrosAtivos)}
+            label="Na comunidade"
+            color="#22c55e"
+          />
+          <MiniStat
+            icon="📢"
+            value={String(totalMembrosCanais)}
+            label="Somente canais"
+            color="#38bdf8"
+          />
+          <MiniStat
+            icon="↪"
+            value={String(totalMembrosSaida)}
+            label="Saíram"
+            color="#f97316"
+          />
+          <MiniStat
+            icon="🚫"
+            value={String(totalMembrosBanidos)}
+            label="Banidos"
+            color="#ef4444"
+          />
+          <MiniStat
+            icon="💬"
+            value={String(totalAtendimentoPendente)}
+            label="Aguardando contato"
+            color="#f59e0b"
+          />
+        </div>
+
         <div style={painelDarkStyle}>
           <div
             style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 12,
-              alignItems: "flex-start",
-              flexWrap: "wrap",
-            }}
-          >
-            <div>
-              <h2 style={tituloCardDarkStyle}>{membroSelecionado.nome}</h2>
-              <p style={{ color: "#94a3b8", marginTop: 6 }}>
-                Pré-visualização do membro selecionado
-              </p>
-            </div>
-            <button
-              onClick={() => setMembroSelecionadoId(null)}
-              style={botaoSecundarioStyle}
-            >
-              Fechar membro
-            </button>
-          </div>
-
-          <div
-            style={{
               display: "grid",
-              gridTemplateColumns: isMobile ? "1fr" : "repeat(3, 1fr)",
-              gap: 14,
-              marginTop: 18,
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "minmax(250px, 1.5fr) repeat(4, minmax(140px, 0.75fr)) auto",
+              gap: 10,
+              alignItems: "end",
+              marginBottom: 14,
             }}
           >
             <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Perfil/Cargo</div>
-              <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                {cargoMembro(membroSelecionado)}
-              </div>
-            </div>
-            <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Telefone</div>
-              <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                {membroSelecionado.telefone || "-"}
-              </div>
-            </div>
-            <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>E-mail</div>
-              <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                {membroSelecionado.email || "-"}
-              </div>
-            </div>
-            <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Idade</div>
-              <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                {membroSelecionado.idade || "-"}
-              </div>
-            </div>
-            <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Entrada</div>
+              <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>Busca</div>
               <input
-                type="date"
-                value={membroSelecionado.data_entrada || ""}
-                onChange={(e) =>
-                  atualizarMembroCampo(
-                    membroSelecionado,
-                    "data_entrada",
-                    e.target.value
-                  )
-                }
+                placeholder="Nome, telefone, status ou atendimento..."
+                value={queryMembros}
+                onChange={(e) => setQueryMembros(e.target.value)}
                 style={inputStyle}
               />
             </div>
             <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Status</div>
+              <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>Status</div>
               <select
-                value={membroSelecionado.status}
+                value={statusMembrosFiltro}
                 onChange={(e) =>
-                  alterarStatusMembro(
-                    membroSelecionado,
-                    e.target.value as StatusMembro
+                  setStatusMembrosFiltro(
+                    e.target.value as
+                      | "todos"
+                      | "na_comunidade"
+                      | "somente_canais"
+                      | "saiu"
+                      | "banido"
                   )
                 }
                 style={inputStyle}
               >
+                <option value="todos">Todos</option>
                 <option value="na_comunidade">Na comunidade</option>
+                <option value="somente_canais">Somente canais</option>
                 <option value="saiu">Saiu</option>
                 <option value="banido">Banido</option>
-                <option value="pausado">Pausado</option>
               </select>
             </div>
             <div>
-              <div style={{ color: "#94a3b8", fontSize: 13 }}>Saída</div>
-              <input
-                type="date"
-                value={membroSelecionado.data_saida || ""}
-                onChange={(e) =>
-                  atualizarMembroCampo(
-                    membroSelecionado,
-                    "data_saida",
-                    e.target.value
-                  )
-                }
-                style={inputStyle}
-              />
-            </div>
-          </div>
-
-          <div style={{ marginTop: 18 }}>
-            <div style={{ color: "#94a3b8", fontSize: 13 }}>Habilidades</div>
-            <div style={{ color: "#cbd5e1", marginTop: 6 }}>
-              {membroSelecionado.habilidades || "Não informado."}
-            </div>
-          </div>
-
-          <div style={{ marginTop: 14 }}>
-            <div style={{ color: "#94a3b8", fontSize: 13 }}>Observações</div>
-            <textarea
-              value={membroSelecionado.observacao || ""}
-              onChange={(e) =>
-                setMembros((lista) =>
-                  lista.map((item) =>
-                    item.id === membroSelecionado.id
-                      ? { ...item, observacao: e.target.value }
-                      : item
-                  )
-                )
-              }
-              onBlur={(e) =>
-                atualizarMembroCampo(
-                  membroSelecionado,
-                  "observacao",
-                  e.target.value
-                )
-              }
-              style={{ ...textareaStyle, minHeight: 90, marginTop: 6 }}
-            />
-          </div>
-        </div>
-      )}
-
-      <div style={painelDarkStyle}>
-        <input
-          placeholder="Buscar por nome, telefone, e-mail, status ou observação..."
-          value={queryMembros}
-          onChange={(e) => setQueryMembros(e.target.value)}
-          style={{ ...inputStyle, marginBottom: 16 }}
-        />
-
-        <div style={{ overflowX: "auto" }}>
-          <table
-            style={{ width: "100%", borderCollapse: "collapse", minWidth: 900 }}
-          >
-            <thead>
-              <tr>
-                {[
-                  "Nome",
-                  "Telefone",
-                  "E-mail",
-                  "Idade",
-                  "Entrada",
-                  "Status",
-                  "Saída",
-                ].map((h) => (
-                  <th key={h} style={tabelaHeaderDarkStyle}>
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {membrosFiltrados.slice(0, 80).map((m) => {
-                const cor = corStatusMembro(m.status);
-                return (
-                  <tr
-                    key={m.id || m.nome}
-                    onClick={() => setMembroSelecionadoId(m.id || null)}
-                    style={{
-                      borderBottom: "1px solid rgba(148,163,184,0.10)",
-                      cursor: "pointer",
-                      background:
-                        membroSelecionadoId === m.id
-                          ? "rgba(37,99,235,0.18)"
-                          : "transparent",
-                    }}
-                  >
-                    <td style={{ ...tabelaCellDarkStyle, fontWeight: 800 }}>
-                      {m.nome}
-                    </td>
-                    <td style={tabelaCellDarkStyle}>{m.telefone || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>{m.email || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>{m.idade || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>
-                      {formatarDataBR(m.data_entrada) || "-"}
-                    </td>
-                    <td style={tabelaCellDarkStyle}>
-                      <span
-                        style={{
-                          background: cor.bg,
-                          color: cor.color,
-                          padding: "7px 10px",
-                          borderRadius: 10,
-                          fontWeight: 900,
-                        }}
-                      >
-                        {statusMembroLabel(m.status)}
-                      </span>
-                    </td>
-                    <td style={tabelaCellDarkStyle}>
-                      {formatarDataBR(m.data_saida) || "-"}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-          {membrosFiltrados.length > 80 && (
-            <div style={{ color: "#94a3b8", marginTop: 12, fontSize: 13 }}>
-              Mostrando 80 de {membrosFiltrados.length}. Use a busca para
-              filtrar.
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-
-  const UsersPage = () => (
-    <div style={{ display: "grid", gap: 18 }}>
-      <div
-        style={{
-          ...painelDarkStyle,
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: isMobile ? "stretch" : "center",
-          flexDirection: isMobile ? "column" : "row",
-          gap: 12,
-        }}
-      >
-        <div>
-          <h2 style={tituloCardDarkStyle}>Controle de Usuários e Permissões</h2>
-          <p style={{ color: "#94a3b8", marginTop: 6 }}>
-            Gerencie cargos, permissões e acessos internos do sistema.
-          </p>
-        </div>
-
-        <button
-          onClick={() => setMostrarFormNovoUsuario((valor) => !valor)}
-          style={botaoPrimarioStyle}
-        >
-          + Novo usuário
-        </button>
-      </div>
-
-      {mostrarFormNovoUsuario && (
-        <div style={painelDarkStyle}>
-          <h2 style={tituloCardDarkStyle}>Novo usuário</h2>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
-              gap: 14,
-              marginTop: 14,
-            }}
-          >
-            <div>
-              <label style={labelStyle}>Nome</label>
-              <input
-                value={novoUsuario.nome}
-                onChange={(e) =>
-                  setNovoUsuario({ ...novoUsuario, nome: e.target.value })
-                }
-                style={inputStyle}
-              />
-            </div>
-            <div>
-              <label style={labelStyle}>E-mail/Login</label>
-              <input
-                value={novoUsuario.login}
-                onChange={(e) =>
-                  setNovoUsuario({ ...novoUsuario, login: e.target.value })
-                }
-                style={inputStyle}
-              />
-            </div>
-            <div>
-              <label style={labelStyle}>Cargo</label>
+              <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>Atendimento</div>
               <select
-                value={novoUsuario.cargo}
-                onChange={(e) => {
-                  const cargo = e.target.value as Cargo;
-                  setNovoUsuario({
-                    ...novoUsuario,
-                    cargo,
-                    training_status: statusPadraoPorCargo(cargo),
-                    ...permissoesPadraoUsuario(cargo),
-                  });
-                }}
+                value={atendimentoMembrosFiltro}
+                onChange={(e) =>
+                  setAtendimentoMembrosFiltro(
+                    e.target.value as AtendimentoMembro | "todos"
+                  )
+                }
                 style={inputStyle}
               >
-                {cargosPermitidosParaCriar(usuarioLogado).map((cargo) => (
-                  <option key={cargo} value={cargo}>
-                    {cargoLabel(cargo)}
+                <option value="todos">Todos</option>
+                <option value="chamar">Chamar</option>
+                <option value="01">01</option>
+                <option value="02">02</option>
+                <option value="concluido">Concluído</option>
+                <option value="erro">Erro</option>
+              </select>
+            </div>
+            <div>
+              <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>Faixa etária</div>
+              <select
+                value={faixaEtariaMembrosFiltro}
+                onChange={(e) => setFaixaEtariaMembrosFiltro(e.target.value)}
+                style={inputStyle}
+              >
+                <option value="todos">Todas</option>
+                {faixasEtariasMembros.map((faixa) => (
+                  <option key={faixa} value={faixa}>
+                    {faixa}
                   </option>
                 ))}
               </select>
             </div>
             <div>
-              <label style={labelStyle}>Vínculo</label>
-              <input
-                value={novoUsuario.vinculo}
+              <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 6 }}>Ordenar por</div>
+              <select
+                value={ordenacaoMembros}
                 onChange={(e) =>
-                  setNovoUsuario({ ...novoUsuario, vinculo: e.target.value })
+                  setOrdenacaoMembros(
+                    e.target.value as "recentes" | "antigos" | "nome_az" | "nome_za"
+                  )
                 }
                 style={inputStyle}
-              />
+              >
+                <option value="recentes">Mais recentes</option>
+                <option value="antigos">Mais antigos</option>
+                <option value="nome_az">Nome A-Z</option>
+                <option value="nome_za">Nome Z-A</option>
+              </select>
             </div>
+            <button
+              type="button"
+              onClick={() => {
+                setQueryMembros("");
+                setStatusMembrosFiltro("todos");
+                setAtendimentoMembrosFiltro("todos");
+                setFaixaEtariaMembrosFiltro("todos");
+                setOrdenacaoMembros("recentes");
+              }}
+              style={{ ...botaoSecundarioStyle, minHeight: 42, whiteSpace: "nowrap" }}
+            >
+              Limpar filtros
+            </button>
+          </div>
+
+          <div style={{ color: "#64748b", fontSize: 12, marginBottom: 12 }}>
+            {membrosFiltrados.length} de {membros.length} ficha(s) exibida(s).
+          </div>
+
+          <div style={{ overflowX: "auto" }}>
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                minWidth: 900,
+              }}
+            >
+              <thead>
+                <tr>
+                  {[
+                    "Nome",
+                    "Telefone",
+                    "Idade",
+                    "Entrada",
+                    "Status",
+                    "Atendimento",
+                  ].map((h) => (
+                    <th key={h} style={tabelaHeaderDarkStyle}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {membrosFiltrados.slice(0, 80).map((m) => {
+                  const cor = paletaStatusMembroTag(m.status);
+                  const corAtendimento = paletaAtendimentoMembroTag(m.atendimento);
+                  const selecionado = membroSelecionadoId === m.id;
+
+                  return (
+                    <React.Fragment key={m.id || m.nome}>
+                      <tr
+                        onClick={() => selecionarMembroTabela(m)}
+                        style={{
+                          borderBottom: "1px solid rgba(148,163,184,0.10)",
+                          cursor: "pointer",
+                          background: selecionado
+                            ? "rgba(37,99,235,0.18)"
+                            : "transparent",
+                        }}
+                      >
+                        <td
+                          style={{
+                            ...tabelaCellDarkStyle,
+                            fontWeight: 800,
+                            maxWidth: 280,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                            }}
+                          >
+                            <span
+                              style={{
+                                color: selecionado ? "#60a5fa" : "#64748b",
+                                fontSize: 10,
+                              }}
+                            >
+                              {selecionado ? "▼" : "▶"}
+                            </span>
+                            <span>{m.nome || "(sem nome)"}</span>
+                            {m.idade_inconsistente && (
+                              <span
+                                title="Idade e faixa etária não conferem."
+                                style={{
+                                  color: "#fca5a5",
+                                  fontSize: 12,
+                                }}
+                              >
+                                ⚠
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td style={tabelaCellDarkStyle}>
+                          {m.telefone || "-"}
+                        </td>
+                        <td style={tabelaCellDarkStyle}>{m.idade ?? "-"}</td>
+                        <td style={tabelaCellDarkStyle}>
+                          {formatarDataBR(m.data_entrada) || "-"}
+                        </td>
+                        <td
+                          style={tabelaCellDarkStyle}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <select
+                            className={`dw-member-tag-select dw-member-status-${m.status}`}
+                            value={m.status}
+                            onChange={(e) =>
+                              alterarStatusMembro(
+                                m,
+                                e.target.value as StatusMembro
+                              )
+                            }
+                            style={estiloSelectStatus(cor.bg, cor.color, cor.border)}
+                          >
+                            <option value="nao_definido">Não definido</option>
+                            <option value="na_comunidade">
+                              Comunidade
+                            </option>
+                            <option value="somente_canais">
+                              Canais
+                            </option>
+                            <option value="saiu">Saiu</option>
+                            <option value="banido">Ban</option>
+                            <option value="pausado">Pausado</option>
+                          </select>
+                        </td>
+                        <td
+                          style={tabelaCellDarkStyle}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <select
+                            className={`dw-member-tag-select dw-member-atendimento-${String(m.atendimento || "chamar").replace(/[^a-zA-Z0-9_-]/g, "")}`}
+                            value={String(m.atendimento || "chamar")}
+                            onChange={(e) =>
+                              alterarAtendimentoMembro(
+                                m,
+                                e.target.value as AtendimentoMembro
+                              )
+                            }
+                            style={estiloSelectStatus(
+                              corAtendimento.bg,
+                              corAtendimento.color,
+                              corAtendimento.border
+                            )}
+                          >
+                            <option value="chamar">Chamar</option>
+                            <option value="01">01</option>
+                            <option value="02">02</option>
+                            <option value="concluido">Concluído</option>
+                            <option value="erro">Erro</option>
+                          </select>
+                        </td>
+                      </tr>
+
+                      {selecionado && (
+                        <tr>
+                          <td
+                            colSpan={6}
+                            style={{
+                              padding: 0,
+                              borderBottom:
+                                "1px solid rgba(148,163,184,0.10)",
+                            }}
+                          >
+                            {renderDetalhesMembro(m)}
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            {membrosFiltrados.length > 80 && (
+              <div
+                style={{
+                  color: "#94a3b8",
+                  marginTop: 12,
+                  fontSize: 13,
+                }}
+              >
+                Mostrando 80 de {membrosFiltrados.length}. Use a busca para
+                filtrar.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const UsersPage = () => {
+    const chaveUsuario = (usuario: Usuario) =>
+      String(usuario.id || usuario.login || usuario.nome);
+
+    const cargosFiltroDisponiveis = Array.from(
+      new Set(usuariosVisiveis.map((usuario) => usuario.cargo))
+    ).sort((a, b) =>
+      cargoLabel(a).localeCompare(cargoLabel(b), "pt-BR", {
+        sensitivity: "base",
+      })
+    );
+
+    const termoUsuario = normalizar(queryUsuarios);
+    const usuariosLista = usuariosVisiveis.filter((usuario) => {
+      const correspondeNome =
+        !termoUsuario || normalizar(usuario.nome).includes(termoUsuario);
+      const correspondeCargo =
+        cargoFiltroUsuarios === "Todos" ||
+        usuario.cargo === cargoFiltroUsuarios;
+      return correspondeNome && correspondeCargo;
+    });
+
+    const alternarUsuario = (usuario: Usuario) => {
+      const chave = chaveUsuario(usuario);
+      const vaiFechar = usuarioExpandidoId === chave;
+      setUsuarioExpandidoId(vaiFechar ? null : chave);
+      setUsuarioEditandoId(null);
+      setUsuarioEdicao(null);
+      setMostrarFormNovoUsuario(false);
+    };
+
+    const podeEditarPermissoes = podeGerenciarUsuarios(usuarioLogado);
+
+    const podeEditarDadosUsuario = (usuario: Usuario) => {
+      if (!usuarioLogado || !podeGerenciarUsuarios(usuarioLogado)) return false;
+      if (
+        usuario.cargo === "diretoria" &&
+        usuarioLogado.cargo !== "diretoria"
+      ) {
+        return false;
+      }
+      return true;
+    };
+
+    const iniciarEdicaoUsuario = (usuario: Usuario) => {
+      setUsuarioEditandoId(chaveUsuario(usuario));
+      setUsuarioEdicao({ ...usuario });
+    };
+
+    const cancelarEdicaoUsuario = () => {
+      setUsuarioEditandoId(null);
+      setUsuarioEdicao(null);
+    };
+
+    const salvarEdicaoUsuario = async (alvo: Usuario) => {
+      if (!usuarioEdicao || !podeEditarDadosUsuario(alvo)) return;
+
+      const nome = usuarioEdicao.nome.trim();
+      const vinculo = String(usuarioEdicao.vinculo || "").trim();
+      if (!nome) {
+        alert("Informe o nome do usuário.");
+        return;
+      }
+
+      const cargo = usuarioEdicao.cargo;
+      const training_status: TrainingStatus =
+        cargo === "lider_treinamento"
+          ? usuarioEdicao.training_status || "em_andamento"
+          : cargo === "lider"
+            ? usuarioEdicao.training_status || "nao_aplicavel"
+            : "nao_aplicavel";
+
+      const atualizado: Usuario = {
+        ...alvo,
+        nome,
+        cargo,
+        vinculo,
+        training_status,
+      };
+
+      if (READ_ONLY_MODE) {
+        setUsuarios((lista) =>
+          lista.map((usuario) =>
+            chaveUsuario(usuario) === chaveUsuario(alvo) ? atualizado : usuario
+          )
+        );
+        setUsuarioEdicao(atualizado);
+        setUsuarioEditandoId(null);
+        alert(
+          "Modo teste: alteração aplicada somente nesta tela. O Supabase original não foi modificado."
+        );
+        return;
+      }
+
+      if (!alvo.id) {
+        alert("Não foi possível identificar esse usuário no banco.");
+        return;
+      }
+
+      const { error } = await supabase
+        .from("usuarios")
+        .update({
+          nome: atualizado.nome,
+          cargo: atualizado.cargo,
+          vinculo: atualizado.vinculo,
+          training_status: atualizado.training_status,
+        })
+        .eq("id", alvo.id);
+
+      if (error) {
+        console.error("Erro ao editar usuário:", error);
+        alert("Não consegui salvar as alterações do usuário.");
+        return;
+      }
+
+      setUsuarios((lista) =>
+        lista.map((usuario) =>
+          chaveUsuario(usuario) === chaveUsuario(alvo) ? atualizado : usuario
+        )
+      );
+      setUsuarioEdicao(atualizado);
+      setUsuarioEditandoId(null);
+      alert("Usuário atualizado com sucesso.");
+    };
+
+    const iconePermissao = (chave: ChavePermissao) => {
+      const icones: Partial<Record<ChavePermissao, string>> = {
+        acesso_projetos: "▣",
+        acesso_membros: "♟",
+        acesso_usuarios: "♙",
+        acesso_advertencias: "△",
+        acesso_eventos: "▦",
+        acesso_aprovacao_eventos: "✓",
+        acesso_projetos_finalizados: "◈",
+        acesso_relatorios_projetos: "▥",
+        acesso_relatorios_elenco: "▤",
+        acesso_relatorios_membros: "▧",
+        acesso_relatorios_entrada_saida: "↔",
+        acesso_exportacoes: "⇩",
+        acesso_treinamentos: "◇",
+      };
+      return icones[chave] || "•";
+    };
+
+    const renderDetalheInline = (usuario: Usuario) => {
+      const inicial = String(usuario.nome || usuario.login || "U")
+        .trim()
+        .charAt(0)
+        .toUpperCase();
+      const permitidoCount = permissoesDisponiveis.filter((item) =>
+        temAcesso(usuario, item.chave)
+      ).length;
+      const editando =
+        usuarioEditandoId === chaveUsuario(usuario) && Boolean(usuarioEdicao);
+      const cargosEditaveis = Array.from(
+        new Set([
+          ...cargosPermitidosParaCriar(usuarioLogado),
+          usuario.cargo,
+        ])
+      );
+
+      return (
+        <div
+          style={{
+            margin: isMobile ? "0 8px 10px" : "0 12px 12px",
+            padding: isMobile ? 13 : 16,
+            borderRadius: 15,
+            border: "1px solid rgba(56,189,248,.24)",
+            background:
+              "linear-gradient(180deg, rgba(15,35,66,.72), rgba(8,18,36,.78))",
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,.02)",
+          }}
+        >
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "minmax(260px, 1.25fr) repeat(3, minmax(120px, .6fr)) auto",
+              alignItems: "center",
+              gap: isMobile ? 12 : 0,
+              paddingBottom: 15,
+              borderBottom: "1px solid rgba(148,163,184,.12)",
+            }}
+          >
+            <div
+              style={{
+                minWidth: 0,
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                paddingRight: isMobile ? 0 : 18,
+              }}
+            >
+              <div
+                style={{
+                  width: 50,
+                  height: 50,
+                  borderRadius: "50%",
+                  flex: "0 0 auto",
+                  display: "grid",
+                  placeItems: "center",
+                  color: "#dbeafe",
+                  fontSize: 17,
+                  fontWeight: 950,
+                  background:
+                    "linear-gradient(145deg, rgba(59,130,246,.38), rgba(30,41,59,.95))",
+                  border: "1px solid rgba(96,165,250,.24)",
+                }}
+              >
+                {inicial}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div
+                  style={{
+                    color: "#f8fafc",
+                    fontSize: 16,
+                    fontWeight: 950,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {usuario.nome || "Usuário sem nome"}
+                </div>
+                <div
+                  style={{
+                    color: "#94a3b8",
+                    fontSize: 11,
+                    marginTop: 4,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {usuario.login || "E-mail não informado"}
+                </div>
+              </div>
+            </div>
+
+            {[
+              ["Cargo", cargoLabel(usuario.cargo)],
+              ["Vínculo", usuario.vinculo || "Não informado"],
+              ["Treinamento", statusTreinamentoLabel(usuario.training_status)],
+            ].map(([titulo, valor], index) => (
+              <div
+                key={titulo}
+                style={{
+                  minWidth: 0,
+                  padding: isMobile ? "10px 0 0" : "2px 16px",
+                  borderLeft:
+                    !isMobile && index >= 0
+                      ? "1px solid rgba(148,163,184,.14)"
+                      : undefined,
+                }}
+              >
+                <div style={{ color: "#94a3b8", fontSize: 10, fontWeight: 750 }}>
+                  {titulo}
+                </div>
+                <div
+                  style={{
+                    color: "#e2e8f0",
+                    fontSize: 12,
+                    fontWeight: 850,
+                    marginTop: 5,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={String(valor)}
+                >
+                  {valor}
+                </div>
+              </div>
+            ))}
+
+            {podeEditarDadosUsuario(usuario) && (
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: isMobile ? "flex-start" : "flex-end",
+                  alignItems: "center",
+                  paddingLeft: isMobile ? 0 : 14,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() =>
+                    editando
+                      ? cancelarEdicaoUsuario()
+                      : iniciarEdicaoUsuario(usuario)
+                  }
+                  style={{
+                    ...botaoSecundarioStyle,
+                    padding: "8px 11px",
+                    whiteSpace: "nowrap",
+                    borderColor: editando
+                      ? "rgba(248,113,113,.30)"
+                      : "rgba(96,165,250,.28)",
+                    color: editando ? "#fecaca" : "#bfdbfe",
+                  }}
+                >
+                  {editando ? "Cancelar edição" : "✎ Editar usuário"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {editando && usuarioEdicao && (
+            <div
+              style={{
+                marginTop: 14,
+                padding: 14,
+                borderRadius: 13,
+                border: "1px solid rgba(96,165,250,.20)",
+                background: "rgba(15,23,42,.58)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "flex-start",
+                  gap: 12,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <div
+                    style={{
+                      color: "#f8fafc",
+                      fontSize: 13,
+                      fontWeight: 950,
+                    }}
+                  >
+                    Editar usuário
+                  </div>
+                  <div
+                    style={{
+                      color: "#94a3b8",
+                      fontSize: 10,
+                      marginTop: 3,
+                    }}
+                  >
+                    Altere os dados internos do perfil. O e-mail de acesso não é alterado por aqui.
+                  </div>
+                </div>
+
+                {READ_ONLY_MODE && (
+                  <span
+                    style={{
+                      color: "#fbbf24",
+                      fontSize: 10,
+                      fontWeight: 850,
+                    }}
+                  >
+                    Simulação local · Supabase protegido
+                  </span>
+                )}
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: isMobile
+                    ? "1fr"
+                    : "repeat(4, minmax(0, 1fr))",
+                  gap: 10,
+                  marginTop: 12,
+                }}
+              >
+                <div>
+                  <label style={labelStyle}>Nome</label>
+                  <input
+                    value={usuarioEdicao.nome}
+                    onChange={(e) =>
+                      setUsuarioEdicao({
+                        ...usuarioEdicao,
+                        nome: e.target.value,
+                      })
+                    }
+                    style={inputStyle}
+                  />
+                </div>
+
+                <div>
+                  <label style={labelStyle}>E-mail</label>
+                  <input
+                    value={usuarioEdicao.login}
+                    readOnly
+                    style={{
+                      ...inputStyle,
+                      opacity: 0.72,
+                      cursor: "not-allowed",
+                    }}
+                  />
+                </div>
+
+                <div>
+                  <label style={labelStyle}>Cargo</label>
+                  <select
+                    value={usuarioEdicao.cargo}
+                    onChange={(e) => {
+                      const cargo = e.target.value as Cargo;
+                      setUsuarioEdicao({
+                        ...usuarioEdicao,
+                        cargo,
+                        training_status:
+                          cargo === "lider_treinamento"
+                            ? usuarioEdicao.training_status === "nao_aplicavel"
+                              ? "em_andamento"
+                              : usuarioEdicao.training_status || "em_andamento"
+                            : cargo === "lider"
+                              ? usuarioEdicao.training_status || "nao_aplicavel"
+                              : "nao_aplicavel",
+                      });
+                    }}
+                    style={inputStyle}
+                  >
+                    {cargosEditaveis.map((cargo) => (
+                      <option key={cargo} value={cargo}>
+                        {cargoLabel(cargo)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label style={labelStyle}>Vínculo</label>
+                  <input
+                    value={usuarioEdicao.vinculo || ""}
+                    onChange={(e) =>
+                      setUsuarioEdicao({
+                        ...usuarioEdicao,
+                        vinculo: e.target.value,
+                      })
+                    }
+                    style={inputStyle}
+                  />
+                </div>
+
+                {(usuarioEdicao.cargo === "lider_treinamento" ||
+                  usuarioEdicao.cargo === "lider") && (
+                  <div style={{ gridColumn: isMobile ? undefined : "1 / 2" }}>
+                    <label style={labelStyle}>Treinamento</label>
+                    <select
+                      value={usuarioEdicao.training_status || "nao_aplicavel"}
+                      onChange={(e) =>
+                        setUsuarioEdicao({
+                          ...usuarioEdicao,
+                          training_status: e.target.value as TrainingStatus,
+                        })
+                      }
+                      style={inputStyle}
+                    >
+                      <option value="nao_aplicavel">Não aplicável</option>
+                      <option value="pendente">Pendente</option>
+                      <option value="em_andamento">Em andamento</option>
+                      <option value="concluido">Concluído</option>
+                      <option value="reprovado">Reprovado</option>
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  gap: 9,
+                  marginTop: 12,
+                  flexWrap: "wrap",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={cancelarEdicaoUsuario}
+                  style={botaoSecundarioStyle}
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void salvarEdicaoUsuario(usuario)}
+                  style={botaoPrimarioStyle}
+                >
+                  Salvar alterações
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-end",
+              gap: 12,
+              flexWrap: "wrap",
+              marginTop: 13,
+            }}
+          >
+            <div>
+              <div
+                style={{
+                  color: "#f8fafc",
+                  fontSize: 13,
+                  fontWeight: 950,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <span style={{ color: "#60a5fa" }}>▣</span>
+                Permissões de Acesso
+              </div>
+              <div style={{ color: "#94a3b8", fontSize: 10, marginTop: 4 }}>
+                {permitidoCount} de {permissoesDisponiveis.length} acessos permitidos.
+              </div>
+            </div>
+
+            {READ_ONLY_MODE && (
+              <div
+                style={{
+                  color: "#fbbf24",
+                  fontSize: 10,
+                  fontWeight: 800,
+                  textAlign: "right",
+                }}
+              >
+                Modo teste: alterações simuladas somente nesta tela.
+              </div>
+            )}
           </div>
 
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: isMobile ? "1fr" : "repeat(3, 1fr)",
-              gap: 10,
-              marginTop: 16,
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "repeat(auto-fit, minmax(230px, 1fr))",
+              gap: 8,
+              marginTop: 12,
+            }}
+          >
+            {permissoesDisponiveis.map((item) => {
+              const permitido = temAcesso(usuario, item.chave);
+              return (
+                <button
+                  key={item.chave}
+                  type="button"
+                  disabled={!podeEditarPermissoes}
+                  onClick={() =>
+                    atualizarPermissaoUsuario(usuario, item.chave, !permitido)
+                  }
+                  title={
+                    podeEditarPermissoes
+                      ? READ_ONLY_MODE
+                        ? `Clique para ${permitido ? "bloquear" : "permitir"} este acesso nesta simulação. O Supabase original não será alterado.`
+                        : `Clique para ${permitido ? "bloquear" : "permitir"} este acesso.`
+                      : "Você não tem permissão para alterar este acesso."
+                  }
+                  style={{
+                    appearance: "none",
+                    minHeight: 48,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    padding: "9px 10px",
+                    borderRadius: 11,
+                    border: permitido
+                      ? "1px solid rgba(34,197,94,.20)"
+                      : "1px solid rgba(248,113,113,.16)",
+                    background: permitido
+                      ? "rgba(21,128,61,.09)"
+                      : "rgba(127,29,29,.08)",
+                    color: "inherit",
+                    textAlign: "left",
+                    cursor: podeEditarPermissoes ? "pointer" : "default",
+                    opacity: !podeEditarPermissoes ? 0.86 : 1,
+                  }}
+                >
+                  <span
+                    style={{
+                      minWidth: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 9,
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 28,
+                        height: 28,
+                        borderRadius: 9,
+                        display: "grid",
+                        placeItems: "center",
+                        flex: "0 0 auto",
+                        color: "#bfdbfe",
+                        background: "rgba(30,41,59,.78)",
+                        border: "1px solid rgba(148,163,184,.14)",
+                        fontSize: 13,
+                        fontWeight: 950,
+                      }}
+                    >
+                      {iconePermissao(item.chave)}
+                    </span>
+                    <span
+                      style={{
+                        minWidth: 0,
+                        color: "#e2e8f0",
+                        fontSize: 11,
+                        fontWeight: 850,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={item.label}
+                    >
+                      {item.label}
+                    </span>
+                  </span>
+
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      flex: "0 0 auto",
+                      padding: "5px 8px",
+                      borderRadius: 999,
+                      color: permitido ? "#86efac" : "#fca5a5",
+                      background: permitido
+                        ? "rgba(22,101,52,.34)"
+                        : "rgba(127,29,29,.34)",
+                      border: permitido
+                        ? "1px solid rgba(34,197,94,.17)"
+                        : "1px solid rgba(248,113,113,.14)",
+                      fontSize: 9,
+                      fontWeight: 900,
+                    }}
+                  >
+                    {permitido ? "✓ Permitido" : "× Bloqueado"}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      );
+    };
+
+    const renderNovoUsuarioPanel = () => (
+      <div
+        style={{
+          ...painelDarkStyle,
+          minHeight: isMobile ? undefined : 620,
+          padding: isMobile ? 16 : 20,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 18,
+          }}
+        >
+          <div>
+            <div style={{ color: "#f8fafc", fontSize: 19, fontWeight: 950 }}>
+              Novo usuário
+            </div>
+            <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>
+              Cadastre um novo acesso interno ao Manager.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setMostrarFormNovoUsuario(false)}
+            style={{ ...botaoSecundarioStyle, padding: "8px 11px" }}
+          >
+            Fechar
+          </button>
+        </div>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))",
+            gap: 12,
+          }}
+        >
+          <div>
+            <label style={labelStyle}>Nome</label>
+            <input
+              value={novoUsuario.nome}
+              onChange={(e) =>
+                setNovoUsuario({ ...novoUsuario, nome: e.target.value })
+              }
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>E-mail/Login</label>
+            <input
+              type="email"
+              value={novoUsuario.login}
+              onChange={(e) =>
+                setNovoUsuario({ ...novoUsuario, login: e.target.value })
+              }
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>Senha inicial</label>
+            <input
+              type="password"
+              value={novaSenhaUsuario}
+              onChange={(e) => setNovaSenhaUsuario(e.target.value)}
+              placeholder="Mínimo de 8 caracteres"
+              autoComplete="new-password"
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>Cargo</label>
+            <select
+              value={novoUsuario.cargo}
+              onChange={(e) => {
+                const cargo = e.target.value as Cargo;
+                setNovoUsuario({
+                  ...novoUsuario,
+                  cargo,
+                  training_status: statusPadraoPorCargo(cargo),
+                  ...permissoesPadraoUsuario(cargo),
+                });
+              }}
+              style={inputStyle}
+            >
+              {cargosPermitidosParaCriar(usuarioLogado).map((cargo) => (
+                <option key={cargo} value={cargo}>
+                  {cargoLabel(cargo)}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ gridColumn: isMobile ? undefined : "1 / -1" }}>
+            <label style={labelStyle}>Vínculo</label>
+            <input
+              value={novoUsuario.vinculo}
+              onChange={(e) =>
+                setNovoUsuario({ ...novoUsuario, vinculo: e.target.value })
+              }
+              style={inputStyle}
+            />
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 18,
+            paddingTop: 16,
+            borderTop: "1px solid rgba(148,163,184,.12)",
+          }}
+        >
+          <div style={{ color: "#e2e8f0", fontWeight: 900, fontSize: 13 }}>
+            Permissões iniciais
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "repeat(2, minmax(0, 1fr))",
+              gap: 9,
+              marginTop: 10,
             }}
           >
             {permissoesDisponiveis.map((item) => (
@@ -7946,9 +12246,14 @@ export default function DubworksManager() {
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
+                  gap: 9,
+                  padding: "10px 11px",
+                  borderRadius: 11,
+                  border: "1px solid rgba(148,163,184,.13)",
+                  background: "rgba(15,23,42,.52)",
                   color: "#cbd5e1",
-                  fontWeight: 700,
+                  fontSize: 12,
+                  fontWeight: 750,
                 }}
               >
                 <input
@@ -7965,422 +12270,404 @@ export default function DubworksManager() {
               </label>
             ))}
           </div>
+        </div>
 
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 10,
+            marginTop: 18,
+            flexWrap: "wrap",
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setMostrarFormNovoUsuario(false)}
+            style={botaoSecundarioStyle}
+          >
+            Cancelar
+          </button>
+          <button
+            type="button"
+            onClick={criarUsuario}
+            style={{
+              ...botaoPrimarioStyle,
+              opacity: READ_ONLY_MODE ? 0.62 : 1,
+              cursor: READ_ONLY_MODE ? "not-allowed" : "pointer",
+            }}
+            title={
+              READ_ONLY_MODE
+                ? "Bloqueado no modo teste para proteger o Supabase original."
+                : undefined
+            }
+          >
+            Salvar usuário
+          </button>
+        </div>
+
+        {READ_ONLY_MODE && (
           <div
             style={{
-              display: "flex",
-              gap: 10,
-              marginTop: 18,
-              flexWrap: "wrap",
+              marginTop: 12,
+              color: "#fbbf24",
+              fontSize: 11,
+              fontWeight: 750,
+              textAlign: "right",
             }}
           >
-            <button onClick={criarUsuario} style={botaoPrimarioStyle}>
-              Salvar usuário
-            </button>
-            <button
-              onClick={() => setMostrarFormNovoUsuario(false)}
-              style={botaoSecundarioStyle}
-            >
-              Cancelar
-            </button>
+            Modo teste: o cadastro pode ser preenchido, mas não será enviado ao Supabase.
           </div>
-        </div>
-      )}
+        )}
+      </div>
+    );
 
-      {isMobile ? (
-        <div style={{ display: "grid", gap: 12 }}>
-          {usuarios.map((usuario) => (
-            <article
-              key={usuario.id || usuario.login}
-              style={{
-                ...painelDarkStyle,
-                padding: 16,
-                display: "grid",
-                gap: 14,
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "flex-start",
-                  gap: 12,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <div
-                    style={{
-                      color: "#f8fafc",
-                      fontWeight: 900,
-                      fontSize: 16,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {usuario.nome || "Usuário sem nome"}
-                  </div>
-                  <div
-                    style={{
-                      color: "#94a3b8",
-                      fontSize: 12,
-                      marginTop: 3,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {usuario.login}
-                  </div>
-                </div>
 
-                <span
-                  style={{
-                    flex: "0 0 auto",
-                    padding: "6px 9px",
-                    borderRadius: 999,
-                    color: "#bfdbfe",
-                    background: "rgba(37,99,235,.16)",
-                    border: "1px solid rgba(96,165,250,.18)",
-                    fontSize: 11,
-                    fontWeight: 900,
-                  }}
-                >
-                  {cargoLabel(usuario.cargo)}
-                </span>
-              </div>
-
-              <div style={{ display: "grid", gap: 8 }}>
-                {([
-                  ["acesso_projetos", "Projetos"],
-                  ["acesso_membros", "Membros"],
-                  ["acesso_usuarios", "Usuários"],
-                  ["acesso_relatorios_projetos", "Relatórios"],
-                ] as [ChavePermissao, string][]).map(([chave, label]) => {
-                  const permitido = temAcesso(usuario, chave);
-
-                  return (
-                    <label
-                      key={chave}
-                      style={{
-                        minWidth: 0,
-                        minHeight: 44,
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                        padding: "9px 11px",
-                        borderRadius: 12,
-                        background: "rgba(2,6,23,.48)",
-                        border: "1px solid rgba(148,163,184,.10)",
-                        cursor: podeGerenciarUsuarios(usuarioLogado)
-                          ? "pointer"
-                          : "default",
-                      }}
-                    >
-                      <span style={{ color: "#cbd5e1", fontWeight: 800 }}>
-                        {label}
-                      </span>
-
-                      <span
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          color: permitido ? "#86efac" : "#fca5a5",
-                          fontSize: 12,
-                          fontWeight: 900,
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={permitido}
-                          disabled={!podeGerenciarUsuarios(usuarioLogado)}
-                          onChange={(e) =>
-                            atualizarPermissaoUsuario(
-                              usuario,
-                              chave,
-                              e.target.checked
-                            )
-                          }
-                        />
-                        {permitido ? "Permitido" : "Bloqueado"}
-                      </span>
-                    </label>
-                  );
-                })}
-              </div>
-            </article>
-          ))}
-        </div>
-      ) : (
+    return (
+      <div style={{ display: "grid", gap: 16 }}>
         <div
           style={{
             ...painelDarkStyle,
-            overflowX: "auto",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: isMobile ? "stretch" : "center",
+            flexDirection: isMobile ? "column" : "row",
+            gap: 12,
+            padding: isMobile ? 16 : 20,
           }}
         >
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr>
-                {[
-                  "Usuário",
-                  "Cargo",
-                  "Projetos",
-                  "Membros",
-                  "Usuários",
-                  "Relatórios",
-                ].map((titulo) => (
-                  <th
-                    key={titulo}
-                    style={{
-                      textAlign: "left",
-                      padding: 14,
-                      color: "#94a3b8",
-                      fontSize: 13,
-                      borderBottom: "1px solid rgba(148,163,184,0.14)",
-                    }}
-                  >
-                    {titulo}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-
-            <tbody>
-              {usuarios.map((usuario) => (
-                <tr key={usuario.id || usuario.login}>
-                  <td
-                    style={{
-                      padding: 14,
-                      borderBottom: "1px solid rgba(148,163,184,0.08)",
-                    }}
-                  >
-                    <div style={{ color: "#f8fafc", fontWeight: 700 }}>
-                      {usuario.nome}
-                    </div>
-                    <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                      @{usuario.login}
-                    </div>
-                  </td>
-
-                  <td style={{ padding: 14, color: "#cbd5e1" }}>
-                    {usuario.cargo}
-                  </td>
-
-                  {([
-                    "acesso_projetos",
-                    "acesso_membros",
-                    "acesso_usuarios",
-                    "acesso_relatorios_projetos",
-                  ] as ChavePermissao[]).map((chave) => {
-                    const permitido = temAcesso(usuario, chave);
-                    return (
-                      <td
-                        key={chave}
-                        style={{
-                          padding: 14,
-                          color: permitido ? "#22c55e" : "#ef4444",
-                          fontWeight: 700,
-                        }}
-                      >
-                        <label
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 8,
-                            cursor: "pointer",
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={permitido}
-                            disabled={!podeGerenciarUsuarios(usuarioLogado)}
-                            onChange={(e) =>
-                              atualizarPermissaoUsuario(
-                                usuario,
-                                chave,
-                                e.target.checked
-                              )
-                            }
-                          />
-                          {permitido ? "Permitido" : "Bloqueado"}
-                        </label>
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <div style={pageHeaderDarkStyle}>
-        <div>
-          <div style={breadcrumbDarkStyle}>Usuários</div>
-          <h1 style={pageTitleDarkStyle}>Acessos e Permissões</h1>
-        </div>
-        <button onClick={recarregarUsuarios} style={botaoPrimarioStyle}>
-          Atualizar
-        </button>
-      </div>
-
-      {isMobile ? (
-        <div style={{ display: "grid", gap: 10 }}>
-          {usuariosVisiveis.map((u) => (
-            <article
-              key={u.id || u.login}
+          <div>
+            <div
               style={{
-                ...painelDarkStyle,
-                padding: 15,
-                display: "grid",
-                gap: 10,
+                color: "#f8fafc",
+                fontSize: isMobile ? 19 : 22,
+                fontWeight: 950,
               }}
             >
-              <div style={{ minWidth: 0 }}>
-                <strong
-                  style={{
-                    display: "block",
-                    color: "#f8fafc",
-                    fontSize: 15,
-                    overflowWrap: "anywhere",
-                  }}
-                >
-                  {u.nome}
-                </strong>
-                <span
-                  style={{
-                    display: "block",
-                    color: "#94a3b8",
-                    fontSize: 12,
-                    marginTop: 3,
-                    overflowWrap: "anywhere",
-                  }}
-                >
-                  {u.login}
-                </span>
-              </div>
+              Controle de Usuários e Permissões
+            </div>
+            <div style={{ color: "#94a3b8", marginTop: 5, fontSize: 12 }}>
+              Gerencie cargos, permissões e acessos internos do sistema. Clique em um usuário para visualizar suas permissões.
+            </div>
+          </div>
 
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                  gap: 8,
-                }}
-              >
-                <div>
-                  <div style={{ color: "#64748b", fontSize: 10 }}>Cargo</div>
-                  <div style={{ color: "#cbd5e1", fontWeight: 800 }}>
-                    {cargoLabel(u.cargo)}
-                  </div>
-                </div>
-                <div>
-                  <div style={{ color: "#64748b", fontSize: 10 }}>Vínculo</div>
-                  <div
-                    style={{
-                      color: "#cbd5e1",
-                      fontWeight: 800,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {u.vinculo || "-"}
-                  </div>
-                </div>
-                <div style={{ gridColumn: "1 / -1" }}>
-                  <div style={{ color: "#64748b", fontSize: 10 }}>
-                    Treinamento
-                  </div>
-                  <div style={{ color: "#cbd5e1", fontWeight: 800 }}>
-                    {statusTreinamentoLabel(u.training_status)}
-                  </div>
-                </div>
-              </div>
-            </article>
-          ))}
-        </div>
-      ) : (
-        <div style={painelDarkStyle}>
-          <div style={{ overflowX: "auto" }}>
-            <table
-              style={{
-                width: "100%",
-                borderCollapse: "collapse",
-                minWidth: 860,
+          <div style={{ display: "flex", gap: 9, flexWrap: "wrap" }}>
+            <button onClick={recarregarUsuarios} style={botaoSecundarioStyle}>
+              ↻ Atualizar
+            </button>
+            <button
+              onClick={() => {
+                setMostrarFormNovoUsuario((atual) => !atual);
+                setUsuarioExpandidoId(null);
+                setUsuarioEditandoId(null);
+                setUsuarioEdicao(null);
               }}
+              style={botaoPrimarioStyle}
             >
-              <thead>
-                <tr>
-                  {["Nome", "Login", "Cargo", "Vínculo", "Treinamento"].map(
-                    (h) => (
-                      <th key={h} style={tabelaHeaderDarkStyle}>
-                        {h}
-                      </th>
-                    )
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {usuariosVisiveis.map((u) => (
-                  <tr
-                    key={u.id || u.login}
-                    style={{
-                      borderBottom: "1px solid rgba(148,163,184,0.10)",
-                    }}
-                  >
-                    <td style={{ ...tabelaCellDarkStyle, fontWeight: 800 }}>
-                      {u.nome}
-                    </td>
-                    <td style={tabelaCellDarkStyle}>{u.login}</td>
-                    <td style={tabelaCellDarkStyle}>{cargoLabel(u.cargo)}</td>
-                    <td style={tabelaCellDarkStyle}>{u.vinculo || "-"}</td>
-                    <td style={tabelaCellDarkStyle}>
-                      {statusTreinamentoLabel(u.training_status)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+              + Novo usuário
+            </button>
           </div>
         </div>
-      )}
-    </div>
-  );
 
-  const ReportsPage = () => (
-    <div style={{ display: "grid", gap: 18 }}>
-      <div style={pageHeaderDarkStyle}>
-        <div>
-          <div style={breadcrumbDarkStyle}>Relatórios</div>
-          <h1 style={pageTitleDarkStyle}>Exportações e Indicadores</h1>
+        {mostrarFormNovoUsuario && renderNovoUsuarioPanel()}
+
+        <div
+          style={{
+            ...painelDarkStyle,
+            padding: 0,
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "minmax(260px, 1fr) minmax(180px, 260px) auto",
+              gap: 10,
+              alignItems: "end",
+              padding: isMobile ? 12 : "13px 16px",
+              borderBottom: "1px solid rgba(148,163,184,.12)",
+              background:
+                "linear-gradient(180deg, rgba(15,23,42,.48), rgba(15,23,42,.22))",
+            }}
+          >
+            <div>
+              <label style={labelStyle}>Pesquisar por nome</label>
+              <input
+                value={queryUsuarios}
+                onChange={(e) => setQueryUsuarios(e.target.value)}
+                placeholder="Digite o nome do usuário..."
+                style={inputStyle}
+              />
+            </div>
+
+            <div>
+              <label style={labelStyle}>Cargo</label>
+              <select
+                value={cargoFiltroUsuarios}
+                onChange={(e) =>
+                  setCargoFiltroUsuarios(e.target.value as "Todos" | Cargo)
+                }
+                style={inputStyle}
+              >
+                <option value="Todos">Todos os cargos</option>
+                {cargosFiltroDisponiveis.map((cargo) => (
+                  <option key={cargo} value={cargo}>
+                    {cargoLabel(cargo)}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQueryUsuarios("");
+                setCargoFiltroUsuarios("Todos");
+              }}
+              disabled={!queryUsuarios && cargoFiltroUsuarios === "Todos"}
+              style={{
+                ...botaoSecundarioStyle,
+                height: 42,
+                opacity:
+                  !queryUsuarios && cargoFiltroUsuarios === "Todos" ? 0.5 : 1,
+                cursor:
+                  !queryUsuarios && cargoFiltroUsuarios === "Todos"
+                    ? "default"
+                    : "pointer",
+              }}
+            >
+              Limpar filtros
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: isMobile
+                ? "minmax(0, 1fr) 90px 28px"
+                : "minmax(220px, .8fr) minmax(300px, 1.85fr) minmax(120px, .7fr) 32px",
+              gap: 10,
+              alignItems: "center",
+              padding: isMobile ? "11px 12px" : "13px 16px",
+              color: "#cbd5e1",
+              fontSize: 11,
+              fontWeight: 900,
+              borderBottom: "1px solid rgba(148,163,184,.15)",
+              background: "rgba(15,23,42,.34)",
+            }}
+          >
+            <span>Nome</span>
+            {!isMobile && <span>E-mail</span>}
+            <span>Cargo</span>
+            <span />
+          </div>
+
+          {usuariosLista.length === 0 ? (
+            <div
+              style={{
+                padding: 30,
+                color: "#94a3b8",
+                textAlign: "center",
+                fontSize: 12,
+              }}
+            >
+              Nenhum usuário encontrado.
+            </div>
+          ) : (
+            usuariosLista.map((usuario) => {
+              const chave = chaveUsuario(usuario);
+              const expandido = usuarioExpandidoId === chave;
+
+              return (
+                <div
+                  key={chave}
+                  style={{
+                    borderBottom: "1px solid rgba(148,163,184,.10)",
+                    background: expandido
+                      ? "linear-gradient(90deg, rgba(37,99,235,.12), rgba(15,23,42,.18))"
+                      : "transparent",
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => alternarUsuario(usuario)}
+                    aria-expanded={expandido}
+                    style={{
+                      appearance: "none",
+                      width: "100%",
+                      border: 0,
+                      background: "transparent",
+                      color: "inherit",
+                      cursor: "pointer",
+                      display: "grid",
+                      gridTemplateColumns: isMobile
+                        ? "minmax(0, 1fr) 90px 28px"
+                        : "minmax(220px, .8fr) minmax(300px, 1.85fr) minmax(120px, .7fr) 32px",
+                      gap: 10,
+                      alignItems: "center",
+                      padding: isMobile ? "12px" : "13px 16px",
+                      textAlign: "left",
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div
+                        style={{
+                          color: "#f8fafc",
+                          fontSize: 13,
+                          fontWeight: 950,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {usuario.nome || "Sem nome"}
+                      </div>
+                      {isMobile && (
+                        <div
+                          style={{
+                            color: "#94a3b8",
+                            fontSize: 9,
+                            marginTop: 3,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {usuario.login}
+                        </div>
+                      )}
+                    </div>
+
+                    {!isMobile && (
+                      <span
+                        style={{
+                          minWidth: 0,
+                          color: "#e2e8f0",
+                          fontSize: 12,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                        title={usuario.login}
+                      >
+                        {usuario.login}
+                      </span>
+                    )}
+
+                    <span
+                      style={{
+                        justifySelf: "start",
+                        maxWidth: "100%",
+                        padding: "5px 8px",
+                        borderRadius: 999,
+                        color: "#bfdbfe",
+                        background: "rgba(37,99,235,.14)",
+                        border: "1px solid rgba(96,165,250,.16)",
+                        fontSize: 9,
+                        fontWeight: 900,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {cargoLabel(usuario.cargo)}
+                    </span>
+
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        justifySelf: "center",
+                        color: expandido ? "#7dd3fc" : "#e2e8f0",
+                        fontSize: 21,
+                        fontWeight: 900,
+                        lineHeight: 1,
+                        transform: expandido ? "rotate(90deg)" : "rotate(0deg)",
+                        transition: "transform .18s ease, color .18s ease",
+                      }}
+                    >
+                      ›
+                    </span>
+                  </button>
+
+                  {expandido && renderDetalheInline(usuario)}
+                </div>
+              );
+            })
+          )}
+
+          <div
+            style={{
+              padding: "11px 16px 13px",
+              color: "#64748b",
+              fontSize: 10,
+            }}
+          >
+            {usuariosLista.length} de {usuariosVisiveis.length} usuário(s) exibido(s).
+          </div>
         </div>
       </div>
+    );
+  };
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: isMobile ? "1fr" : "repeat(3, 1fr)",
-          gap: 16,
-        }}
-      >
-        <button onClick={exportarProjetosCSV} style={reportCardDarkStyle}>
-          📌 Exportar Projetos
-        </button>
-        <button onClick={exportarElencoCSV} style={reportCardDarkStyle}>
-          🎙️ Exportar Elenco
-        </button>
-        {podeGerenciarMembros(usuarioLogado) && (
-          <button onClick={exportarMembrosCSV} style={reportCardDarkStyle}>
-            👥 Exportar Membros
-          </button>
-        )}
-        {podeGerenciarMembros(usuarioLogado) && (
-          <button
-            onClick={exportarRelatorioEntradaSaidaCSV}
-            style={reportCardDarkStyle}
+  const ReportsPage = () => {
+    return (
+      <div style={{ display: "grid", gap: 18 }}>
+        <div style={pageHeaderDarkStyle}>
+          <div>
+            <div style={breadcrumbDarkStyle}>Relatórios</div>
+            <h1 style={pageTitleDarkStyle}>Relatórios</h1>
+            <p style={{ color: "#94a3b8", margin: "7px 0 0", fontSize: 12 }}>
+              Exporte os dados administrativos e o relatório atualizado dos projetos ativos.
+            </p>
+          </div>
+        </div>
+
+        <div style={painelDarkStyle}>
+          <h2 style={tituloCardDarkStyle}>Exportações</h2>
+          <p style={{ color: "#64748b", margin: "6px 0 14px", fontSize: 10 }}>
+            Escolha o relatório que deseja gerar. As exportações apenas consultam os dados atuais do sistema.
+          </p>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: isMobile
+                ? "1fr"
+                : "repeat(auto-fit,minmax(180px,1fr))",
+              gap: 12,
+            }}
           >
-            📊 Entrada e Saída
-          </button>
-        )}
+            <button onClick={exportarProjetosCSV} style={reportCardDarkStyle}>
+              📌 Exportar Projetos
+            </button>
+            <button
+              onClick={() => void exportarRelatorioProjetosAtivosCSV()}
+              style={reportCardDarkStyle}
+            >
+              📋 Exportar Relatório dos Projetos
+            </button>
+            <button onClick={exportarElencoCSV} style={reportCardDarkStyle}>
+              🎙️ Exportar Elenco
+            </button>
+            {podeGerenciarMembros(usuarioLogado) && (
+              <button onClick={exportarMembrosCSV} style={reportCardDarkStyle}>
+                👥 Exportar Membros
+              </button>
+            )}
+            {podeGerenciarMembros(usuarioLogado) && (
+              <button
+                onClick={exportarRelatorioEntradaSaidaCSV}
+                style={reportCardDarkStyle}
+              >
+                📊 Entrada e Saída
+              </button>
+            )}
+          </div>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const cardDarkStyle: React.CSSProperties = {
     padding: 18,
@@ -8527,7 +12814,15 @@ export default function DubworksManager() {
             ← Voltar às ferramentas
           </button>
 
-          <CortesPage />
+          <React.Suspense
+            fallback={
+              <div style={{ padding: 24, color: "#cbd5e1" }}>
+                Carregando editor de cortes...
+              </div>
+            }
+          >
+            <CortesPage />
+          </React.Suspense>
         </div>
       );
     }
@@ -8643,9 +12938,8 @@ export default function DubworksManager() {
         }
 
         if (item.projeto) {
-          setSelecionadoId(item.projeto.ID);
+          abrirPaginaProjeto(item.projeto.ID);
           setMostrarFerramentas(false);
-          setAbaProjeto("informacoes");
         }
       };
 
@@ -11314,7 +15608,7 @@ export default function DubworksManager() {
                       <button
                         type="button"
                         onClick={() => {
-                          setSelecionadoId(projetoCanalAtivo.ID);
+                          abrirPaginaProjeto(projetoCanalAtivo.ID);
                           setMostrarFerramentas(false);
                           setCategoriaFerramentas("inicio");
                         }}
@@ -11516,7 +15810,7 @@ export default function DubworksManager() {
                   borderRadius: 14,
                   padding: 14,
                   background: "rgba(2,6,23,0.62)",
-                  border: "1px solid rgba(148,163,184,0.18)",
+                  border: "1px solid rgba(100,116,139,0.28)",
                   color: "#f8fafc",
                   outline: "none",
                 }}
@@ -11578,7 +15872,7 @@ export default function DubworksManager() {
                       setAcaoPendenteIA(null);
                     }}
                     style={{
-                      border: "1px solid rgba(148,163,184,0.18)",
+                      border: "1px solid rgba(100,116,139,0.28)",
                       background: "rgba(15,23,42,0.65)",
                       color: "#cbd5e1",
                       borderRadius: 10,
@@ -11633,7 +15927,7 @@ export default function DubworksManager() {
                         padding: "5px 9px",
                         borderRadius: 999,
                         background: "rgba(245,158,11,0.12)",
-                        border: "1px solid rgba(245,158,11,0.22)",
+                        border: "1px solid rgba(245,158,11,0.34)",
                         color: "#fde68a",
                         fontSize: 11,
                         fontWeight: 800,
@@ -11685,7 +15979,7 @@ export default function DubworksManager() {
                         padding: 12,
                         borderRadius: 12,
                         background: "rgba(34,197,94,0.08)",
-                        border: "1px solid rgba(34,197,94,0.22)",
+                        border: "1px solid rgba(34,197,94,0.34)",
                       }}
                     >
                       <div style={{ color: "#64748b", fontSize: 11 }}>
@@ -11795,7 +16089,7 @@ export default function DubworksManager() {
                             item.autor === "usuario"
                               ? "14px 14px 4px 14px"
                               : "14px 14px 14px 4px",
-                          padding: "12px 14px",
+                          padding: "10px 12px",
                           background:
                             item.autor === "usuario"
                               ? "linear-gradient(135deg, #2563eb, #0ea5e9)"
@@ -11903,7 +16197,7 @@ export default function DubworksManager() {
                           : "rgba(245,158,11,0.10)",
                       border:
                         ferramenta.status === "Disponível"
-                          ? "1px solid rgba(34,197,94,0.22)"
+                          ? "1px solid rgba(34,197,94,0.34)"
                           : "1px solid rgba(245,158,11,0.20)",
                       color:
                         ferramenta.status === "Disponível"
@@ -12163,6 +16457,37 @@ export default function DubworksManager() {
             <p style={{ color: "#94a3b8", fontSize: 16 }}>
               {moduloSelecionadoTreinamento.descricao}
             </p>
+
+            {moduloSelecionadoTreinamento.id === "pratica-projetos" && (
+              <div
+                style={{
+                  marginTop: 18,
+                  padding: 18,
+                  borderRadius: 16,
+                  border: "1px solid rgba(96,165,250,.28)",
+                  background: "rgba(37,99,235,.10)",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 14,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <strong style={{ color: "#f8fafc" }}>Treinamento guiado no sistema</strong>
+                  <div style={{ color: "#94a3b8", fontSize: 13, marginTop: 5 }}>
+                    O guia usa apenas caixas, setas e destaques. Nenhum personagem aparece.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={iniciarTutorialPraticoProjetos}
+                  style={botaoPrimarioStyle}
+                >
+                  Iniciar treinamento na prática
+                </button>
+              </div>
+            )}
 
             <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
               <h3 style={{ color: "#f8fafc", margin: 0 }}>Conteúdo</h3>
@@ -12425,7 +16750,7 @@ export default function DubworksManager() {
         }}
       >
         <div style={{ minWidth: 0, width: isMobile ? "100%" : "auto" }}>
-          <div style={breadcrumbDarkStyle}>Projetos › Detalhes do Projeto</div>
+          <div style={breadcrumbDarkStyle}>{projetoPainel ? `Projetos › ${projetoPainel.Projeto}` : "Projetos"}</div>
 
           <div
             style={{
@@ -12467,30 +16792,17 @@ export default function DubworksManager() {
             )}
           </div>
 
-          {projetoPainel && statusSincronizacaoAutomatica !== "idle" && (
+          {projetoPainel && statusSincronizacaoAutomatica === "sincronizando" && (
             <div
               style={{
                 marginTop: 7,
-                color:
-                  statusSincronizacaoAutomatica === "erro"
-                    ? "#fbbf24"
-                    : statusSincronizacaoAutomatica === "sincronizando"
-                    ? "#7dd3fc"
-                    : "#86efac",
+                color: "#7dd3fc",
                 fontSize: 12,
                 fontWeight: 700,
-                animation:
-                  statusSincronizacaoAutomatica === "sincronizando"
-                    ? "dwPulse 1.2s ease-in-out infinite"
-                    : undefined,
+                animation: "dwPulse 1.2s ease-in-out infinite",
               }}
             >
-              {statusSincronizacaoAutomatica === "sincronizando"
-                ? "↻ "
-                : statusSincronizacaoAutomatica === "ok"
-                ? "✓ "
-                : "⚠ "}
-              {mensagemSincronizacaoAutomatica}
+              ↻ Sincronizando dados do projeto...
             </div>
           )}
         </div>
@@ -12529,11 +16841,7 @@ export default function DubworksManager() {
 
           {projetoPainel && (
             <button
-              onClick={() => {
-                setSelecionadoId(null);
-                setRascunho(null);
-                setAbaProjeto("informacoes");
-              }}
+              onClick={voltarParaListaProjetos}
               style={{
                 ...botaoSecundarioStyle,
                 width: isMobile ? "100%" : undefined,
@@ -12541,7 +16849,7 @@ export default function DubworksManager() {
                 whiteSpace: "normal",
               }}
             >
-              Fechar visualização
+              ← Voltar aos projetos
             </button>
           )}
 
@@ -12560,8 +16868,9 @@ export default function DubworksManager() {
             </button>
           )}
 
-          {podeCriarProjeto(usuarioLogado) && (
+          {!projetoPainel && podeCriarProjeto(usuarioLogado) && (
             <button
+              data-tutorial-projetos="novo-projeto"
               onClick={() => {
                 limparFormularioProjeto();
                 setMostrarNovoProjeto(true);
@@ -12597,7 +16906,7 @@ export default function DubworksManager() {
       </div>
 
       <div style={painelDarkStyle}>
-        <h2 style={tituloCardDarkStyle}>{projetoPainel ? "Estatísticas do Projeto" : "Estatísticas Gerais"}</h2>
+        <h2 style={tituloCardDarkStyle}>{projetoPainel ? "Estatísticas do Projeto" : "Visão Geral"}</h2>
         <div
           style={{
             display: "grid",
@@ -12617,79 +16926,150 @@ export default function DubworksManager() {
             margin: "18px auto 0",
           }}
         >
-          <MiniStat
-            icon="👥"
-            value={String(estatisticasCards.membrosElenco)}
-            label="Membros no Elenco"
-            color="#3b82f6"
-          />
-          <MiniStat
-            icon="🎙️"
-            value={String(estatisticasCards.videosTestes)}
-            label="Vídeos/Testes"
-            color="#8b5cf6"
-          />
-          <MiniStat
-            icon="🎬"
-            value={String(estatisticasCards.finalizados).padStart(2, "0")}
-            label="Episódios Finalizados"
-            color="#22c55e"
-          />
-          <MiniStat
-            icon="🕒"
-            value={String(estatisticasCards.registros).padStart(2, "0")}
-            label="Registros Semanais"
-            color="#f97316"
-          />
-          <MiniStat
-            icon="📈"
-            value={`${estatisticasCards.progresso}%`}
-            label="Progresso Geral"
-            color="#14b8a6"
-          />
+          {projetoPainel ? (
+            <>
+              <MiniStat
+                icon="👥"
+                value={String(estatisticasCards.membrosElenco)}
+                label="Membros no Elenco"
+                color="#3b82f6"
+              />
+              <MiniStat
+                icon="🎙️"
+                value={String(estatisticasCards.videosTestes)}
+                label="Vídeos/Testes"
+                color="#8b5cf6"
+              />
+              <MiniStat
+                icon="🎬"
+                value={String(estatisticasCards.finalizados).padStart(2, "0")}
+                label="Episódios Finalizados"
+                color="#22c55e"
+              />
+              <MiniStat
+                icon="🕒"
+                value={String(estatisticasCards.registros).padStart(2, "0")}
+                label="Registros Semanais"
+                color="#f97316"
+              />
+              <MiniStat
+                icon="📈"
+                value={`${estatisticasCards.progresso}%`}
+                label="Progresso Geral"
+                color="#14b8a6"
+              />
+            </>
+          ) : (
+            <>
+              <MiniStat
+                icon="📁"
+                value={String(projetosVisiveis.length)}
+                label="Projetos no total"
+                color="#f59e0b"
+              />
+              <MiniStat
+                icon="▶"
+                value={String(projetosAtivosRelatorio.length)}
+                label="Projetos ativos"
+                color="#22c55e"
+              />
+              <MiniStat
+                icon="◉"
+                value={String(
+                  projetosVisiveis.filter((projeto) =>
+                    normalizar(projeto.Status).includes("selec")
+                  ).length
+                )}
+                label="Em seleção"
+                color="#8b5cf6"
+              />
+              <MiniStat
+                icon="■"
+                value={String(
+                  projetosVisiveis.filter((projeto) => {
+                    const status = normalizar(projeto.Status);
+                    return ["final", "conclu", "encerr"].some((termo) =>
+                      status.includes(termo)
+                    );
+                  }).length
+                )}
+                label="Encerrados"
+                color="#ef4444"
+              />
+              <MiniStat
+                icon="📈"
+                value={`${estatisticasCards.progresso}%`}
+                label="Progresso geral"
+                color="#3b82f6"
+              />
+            </>
+          )}
         </div>
       </div>
-
-      <div
-        style={{
-          ...painelDarkStyle,
-          display: "grid",
-          gridTemplateColumns: isMobile ? "1fr" : "1fr 220px",
-          gap: 12,
-          padding: 14,
-        }}
-      >
-        <input
-          placeholder="Buscar por ID, projeto, líder, editor, gênero ou personagem..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          style={inputStyle}
-        />
-        <select
-          value={statusFiltro}
-          onChange={(e) => setStatusFiltro(e.target.value)}
-          style={inputStyle}
-        >
-          <option>Todos</option>
-          {statusUnicos.map((status, i) => (
-            <option key={`${status}-${i}`}>{status}</option>
-          ))}
-        </select>
-      </div>
-
-      {!projetoPainel && ProjectList()}
 
       {!projetoPainel && (
-        <div style={painelDarkStyle}>
-          <h2 style={tituloCardDarkStyle}>Selecione um projeto</h2>
-          <p style={{ color: "#94a3b8" }}>
-            Clique em um projeto da lista acima para abrir a visualização.
-          </p>
-        </div>
+        <>
+          <div
+            style={{
+              ...painelDarkStyle,
+              display: "grid",
+              gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 1fr) 220px 220px",
+              gap: 12,
+              padding: 14,
+            }}
+          >
+            <input
+              placeholder="Buscar por projeto, líder, editor, gênero ou personagem..."
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setPaginaProjetos(1);
+              }}
+              style={inputStyle}
+            />
+            <select
+              value={statusFiltro}
+              onChange={(e) => {
+                setStatusFiltro(e.target.value);
+                setPaginaProjetos(1);
+              }}
+              style={inputStyle}
+              aria-label="Filtrar projetos por status"
+            >
+              <option value="Todos">Todos os status</option>
+              {statusUnicos.map((status, i) => (
+                <option key={`${status}-${i}`} value={status}>{status}</option>
+              ))}
+            </select>
+
+            <select
+              value={generoFiltro}
+              onChange={(e) => {
+                setGeneroFiltro(e.target.value);
+                setPaginaProjetos(1);
+              }}
+              style={inputStyle}
+              aria-label="Filtrar projetos por gênero ou categoria"
+            >
+              <option value="Todos">Todos os gêneros</option>
+              {GENERO_PROJETO_OPCOES.filter((genero) => genero !== "Outro").map(
+                (genero) => (
+                  <option key={genero} value={genero}>
+                    {genero}
+                  </option>
+                )
+              )}
+              <option value="Outro">Outros</option>
+            </select>
+          </div>
+
+          {ProjectList()}
+        </>
       )}
 
       {projetoPainel && (
         <div
+          data-tutorial-projetos="abas-projeto"
           style={{
             ...tabsDarkStyle,
             overflowX: isMobile ? "auto" : tabsDarkStyle.overflowX,
@@ -12703,10 +17083,10 @@ export default function DubworksManager() {
             ["informacoes", "ⓘ Informações"],
             ["selecao", "🎭 Seleção"],
             ["elenco", "🎭 Banco & Semanas"],
-            ["registros", "▣ Registros Semanais"],
-            ["drive", "📁 Arquivos do Drive"],
-            ["atividades", "↔ Atividades"],
+            ["registros", "▣ Registro"],
+            ["atividades", "↔ Atividade"],
             ["historico", "◷ Histórico"],
+            ["relatorios", "▥ Relatórios"],
           ].map(([id, label]) => (
             <button
               key={id}
@@ -12732,7 +17112,7 @@ export default function DubworksManager() {
         </div>
       )}
 
-      {abaProjeto === "informacoes" && (
+      {projetoPainel && abaProjeto === "informacoes" && (
         <div
           style={{
             display: "grid",
@@ -12781,7 +17161,7 @@ export default function DubworksManager() {
               alignItems: "center",
               gap: 12,
               flexWrap: "wrap",
-              border: "1px solid rgba(56,189,248,0.20)",
+              border: "1px solid rgba(14,165,233,0.34)",
             }}
           >
             <div>
@@ -12850,8 +17230,8 @@ export default function DubworksManager() {
               <div>
                 <h2 style={tituloCardDarkStyle}>🎭 Banco do Projeto</h2>
                 <p style={{ color: "#94a3b8", margin: "6px 0 0" }}>
-                  Cadastre os personagens uma única vez. Dublador, telefone e
-                  função podem ficar vazios até a escalação ser definida.
+                  Cadastre os personagens uma única vez. Preencha nome do dublador e
+                  telefone quando a escalação estiver definida.
                 </p>
               </div>
 
@@ -12929,167 +17309,215 @@ export default function DubworksManager() {
               );
             })()}
 
-            <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
+            <div style={{ display: "grid", gap: 8, marginTop: 18 }}>
               {((rascunho || projetoPainel)?.Elenco || []).length ? (
                 ((rascunho || projetoPainel)?.Elenco || []).map((item, index) => {
                   const podeEditarBanco =
                     Boolean(rascunho) &&
                     podeEditarProjeto(usuarioLogado, projetoPainel);
+                  const papelAberto = !item.dublador?.trim();
 
                   return (
-                    <div
+                    <details
                       key={item.id || index}
                       style={{
-                        display: "grid",
-                        gridTemplateColumns: isMobile
-                          ? "1fr"
-                          : "1.1fr 1.1fr 1fr 0.9fr auto",
-                        gap: 12,
-                        alignItems: "end",
                         background: "rgba(2,6,23,0.48)",
-                        border: "1px solid rgba(148,163,184,0.12)",
+                        border: "1px solid rgba(148,163,184,0.14)",
                         borderRadius: 14,
-                        padding: 14,
+                        overflow: "hidden",
                       }}
                     >
-                      <div>
-                        <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                          Personagem *
-                        </div>
-                        {podeEditarBanco ? (
-                          <input
-                            value={item.personagem || ""}
-                            onChange={(e) =>
-                              atualizarElencoRascunho(
-                                index,
-                                "personagem",
-                                e.target.value
-                              )
-                            }
-                            placeholder="Nome do personagem"
-                            style={inputStyle}
-                          />
-                        ) : (
-                          <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                            {item.personagem || "-"}
+                      <summary
+                        style={{
+                          cursor: "pointer",
+                          padding: "12px 14px",
+                          display: "grid",
+                          gridTemplateColumns: isMobile
+                            ? "1fr"
+                            : "minmax(180px,1.25fr) minmax(150px,1fr) auto",
+                          gap: 10,
+                          alignItems: "center",
+                          color: "#f8fafc",
+                          userSelect: "none",
+                        }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ color: "#94a3b8", fontSize: 10, marginBottom: 3 }}>
+                            Personagem
                           </div>
-                        )}
-                      </div>
-
-                      <div>
-                        <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                          Dublador
-                        </div>
-                        {podeEditarBanco ? (
-                          <input
-                            value={item.dublador || ""}
-                            onChange={(e) =>
-                              atualizarElencoRascunho(
-                                index,
-                                "dublador",
-                                e.target.value
-                              )
-                            }
-                            placeholder="Pode ficar vazio"
-                            style={inputStyle}
-                          />
-                        ) : (
-                          <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                            {item.dublador || "Papel aberto"}
-                          </div>
-                        )}
-                      </div>
-
-                      <div>
-                        <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                          Número / ID
-                        </div>
-                        {podeEditarBanco ? (
-                          <input
-                            value={item.telefone_dublador || ""}
-                            onChange={(e) =>
-                              atualizarElencoRascunho(
-                                index,
-                                "telefone_dublador" as any,
-                                e.target.value
-                              )
-                            }
-                            placeholder="Número do dublador"
-                            style={inputStyle}
-                          />
-                        ) : (
-                          <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                            {item.telefone_dublador || "-"}
-                          </div>
-                        )}
-                      </div>
-
-                      <div>
-                        <div style={{ color: "#94a3b8", fontSize: 12 }}>
-                          Função
-                        </div>
-                        {podeEditarBanco ? (
-                          <input
-                            value={item.funcao || ""}
-                            onChange={(e) =>
-                              atualizarElencoRascunho(
-                                index,
-                                "funcao",
-                                e.target.value
-                              )
-                            }
-                            placeholder="Opcional"
-                            style={inputStyle}
-                          />
-                        ) : (
-                          <div style={{ color: "#f8fafc", fontWeight: 900 }}>
-                            {item.funcao || "-"}
-                          </div>
-                        )}
-                      </div>
-
-                      {podeEditarBanco && (
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: 8,
-                            flexWrap: "wrap",
-                            justifyContent: "flex-end",
-                          }}
-                        >
-                          {item.dublador?.trim() && item.id && (
-                            <button
-                              type="button"
-                              disabled={reabrindoPapelId === String(item.id)}
-                              onClick={() => reabrirPapelProjeto(item)}
-                              style={{
-                                ...botaoSecundarioStyle,
-                                color: "#fde68a",
-                                border: "1px solid rgba(245,158,11,0.30)",
-                                background: "rgba(245,158,11,0.10)",
-                              }}
-                            >
-                              {reabrindoPapelId === String(item.id)
-                                ? "Reabrindo..."
-                                : "Reabrir papel"}
-                            </button>
-                          )}
-
-                          <button
-                            type="button"
-                            onClick={() => excluirElencoRascunho(item, index)}
+                          <strong
                             style={{
-                              ...botaoSecundarioStyle,
-                              color: "#fca5a5",
-                              border: "1px solid rgba(248,113,113,0.28)",
-                              background: "rgba(220,38,38,0.12)",
+                              display: "block",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              fontSize: 13,
                             }}
                           >
-                            Retirar do banco
-                          </button>
+                            {item.personagem || "Personagem sem nome"}
+                          </strong>
                         </div>
-                      )}
-                    </div>
+
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ color: "#94a3b8", fontSize: 10, marginBottom: 3 }}>
+                            Dublador
+                          </div>
+                          <span
+                            style={{
+                              display: "block",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              color: papelAberto ? "#fbbf24" : "#cbd5e1",
+                              fontSize: 12,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {item.dublador || "Papel aberto"}
+                          </span>
+                        </div>
+
+                        <span
+                          style={{
+                            justifySelf: isMobile ? "start" : "end",
+                            color: "#7dd3fc",
+                            fontSize: 11,
+                            fontWeight: 800,
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          Abrir detalhes
+                        </span>
+                      </summary>
+
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: isMobile
+                            ? "1fr"
+                            : "1.1fr 1.1fr 1fr auto",
+                          gap: 12,
+                          alignItems: "end",
+                          padding: "14px",
+                          borderTop: "1px solid rgba(148,163,184,0.12)",
+                          background: "rgba(15,23,42,0.38)",
+                        }}
+                      >
+                        <div>
+                          <div style={{ color: "#94a3b8", fontSize: 12 }}>
+                            Personagem *
+                          </div>
+                          {podeEditarBanco ? (
+                            <input
+                              value={item.personagem || ""}
+                              onChange={(e) =>
+                                atualizarElencoRascunho(
+                                  index,
+                                  "personagem",
+                                  e.target.value
+                                )
+                              }
+                              placeholder="Nome do personagem"
+                              style={inputStyle}
+                            />
+                          ) : (
+                            <div style={{ color: "#f8fafc", fontWeight: 900 }}>
+                              {item.personagem || "-"}
+                            </div>
+                          )}
+                        </div>
+
+                        <div>
+                          <div style={{ color: "#94a3b8", fontSize: 12 }}>
+                            Dublador
+                          </div>
+                          {podeEditarBanco ? (
+                            <input
+                              value={item.dublador || ""}
+                              onChange={(e) =>
+                                atualizarElencoRascunho(
+                                  index,
+                                  "dublador",
+                                  e.target.value
+                                )
+                              }
+                              placeholder="Nome do dublador"
+                              style={inputStyle}
+                            />
+                          ) : (
+                            <div style={{ color: "#f8fafc", fontWeight: 900 }}>
+                              {item.dublador || "Papel aberto"}
+                            </div>
+                          )}
+                        </div>
+
+                        <div>
+                          <div style={{ color: "#94a3b8", fontSize: 12 }}>
+                            Telefone do dublador
+                          </div>
+                          {podeEditarBanco ? (
+                            <input
+                              value={item.telefone_dublador || ""}
+                              onChange={(e) =>
+                                atualizarElencoRascunho(
+                                  index,
+                                  "telefone_dublador" as any,
+                                  e.target.value
+                                )
+                              }
+                              placeholder="[00] 00000-0000"
+                              style={inputStyle}
+                            />
+                          ) : (
+                            <div style={{ color: "#f8fafc", fontWeight: 900 }}>
+                              {item.telefone_dublador || "-"}
+                            </div>
+                          )}
+                        </div>
+
+                        {podeEditarBanco && (
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 8,
+                              flexWrap: "wrap",
+                              justifyContent: "flex-end",
+                            }}
+                          >
+                            {item.dublador?.trim() && item.id && (
+                              <button
+                                type="button"
+                                disabled={reabrindoPapelId === String(item.id)}
+                                onClick={() => reabrirPapelProjeto(item)}
+                                style={{
+                                  ...botaoSecundarioStyle,
+                                  color: "#fde68a",
+                                  border: "1px solid rgba(245,158,11,0.30)",
+                                  background: "rgba(245,158,11,0.10)",
+                                }}
+                              >
+                                {reabrindoPapelId === String(item.id)
+                                  ? "Reabrindo..."
+                                  : "Reabrir papel"}
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={() => excluirElencoRascunho(item, index)}
+                              style={{
+                                ...botaoSecundarioStyle,
+                                color: "#fca5a5",
+                                border: "1px solid rgba(248,113,113,0.28)",
+                                background: "rgba(220,38,38,0.12)",
+                              }}
+                            >
+                              Retirar do banco
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </details>
                   );
                 })
               ) : (
@@ -13109,57 +17537,13 @@ export default function DubworksManager() {
             </div>
           </div>
 
-          <div style={painelDarkStyle}>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "flex-start",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
-            >
-              <div>
-                <h2 style={tituloCardDarkStyle}>📅 Semanas do Projeto</h2>
-                <p style={{ color: "#94a3b8", margin: "6px 0 0" }}>
-                  Cada semana possui seu próprio grupo de personagens. Alterações
-                  futuras no elenco não modificam as semanas anteriores.
-                </p>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                {podeEditarProjeto(usuarioLogado, projetoPainel) && (
-                  <button
-                    type="button"
-                    onClick={() => criarNovaSemanaProjeto(projetoPainel)}
-                    disabled={criandoSemanaProjeto}
-                    style={botaoPrimarioStyle}
-                  >
-                    {criandoSemanaProjeto
-                      ? "Criando..."
-                      : semanasProjeto.length
-                      ? "+ Criar próxima semana"
-                      : "+ Criar Semana 01"}
-                  </button>
-                )}
-
-                {semanasProjeto.length > 0 &&
-                  podeEditarProjeto(usuarioLogado, projetoPainel) && (
-                    <button
-                      type="button"
-                      onClick={() => setMostrarAdicionarSemana(true)}
-                      disabled={
-                        alterandoParticipanteSemana ||
-                        semanasProjeto.find(
-                          (item) => item.semana === semanaFiltroProducao
-                        )?.status === "concluida"
-                      }
-                      style={botaoSecundarioStyle}
-                    >
-                      + Adicionar dublador à semana
-                    </button>
-                  )}
-              </div>
+          <div data-tutorial-projetos="semanas-projeto" style={painelDarkStyle}>
+            <div>
+              <h2 style={tituloCardDarkStyle}>📅 Semanas do Projeto</h2>
+              <p style={{ color: "#94a3b8", margin: "6px 0 0" }}>
+                Cada semana possui seu próprio grupo de personagens. Alterações
+                futuras no elenco não modificam as semanas anteriores.
+              </p>
             </div>
 
             {!semanasProjeto.length ? (
@@ -13172,120 +17556,232 @@ export default function DubworksManager() {
                   padding: 22,
                   color: "#cbd5e1",
                   textAlign: "center",
+                  display: "grid",
+                  gap: 14,
+                  justifyItems: "center",
                 }}
               >
-                Nenhuma semana foi criada ainda. A primeira será
-                automaticamente a <strong>Semana 01</strong>.
+                <div>
+                  Nenhuma semana foi criada ainda. A primeira será
+                  automaticamente a <strong>Semana 01</strong>.
+                </div>
+
+                {podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                  <button
+                    type="button"
+                    onClick={() => criarNovaSemanaProjeto(projetoPainel)}
+                    disabled={criandoSemanaProjeto}
+                    style={botaoPrimarioStyle}
+                  >
+                    {criandoSemanaProjeto ? "Criando..." : "+ Criar Semana 01"}
+                  </button>
+                )}
               </div>
             ) : (
               <>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 10,
-                    flexWrap: "wrap",
-                    alignItems: "center",
-                    marginTop: 18,
-                  }}
-                >
-                  <select
-                    value={semanaFiltroProducao}
-                    onChange={(e) =>
-                      setSemanaFiltroProducao(Number(e.target.value))
-                    }
-                    style={inputStyle}
-                  >
-                    {semanasProjeto
-                      .slice()
-                      .sort((a, b) => a.semana - b.semana)
-                      .map((semana) => (
-                        <option key={semana.id || semana.semana} value={semana.semana}>
-                          {labelSemana(semana.semana)}
-                        </option>
-                      ))}
-                  </select>
+                {(() => {
+                  const semanaAtual = semanasProjeto.find(
+                    (item) => item.semana === semanaFiltroProducao
+                  );
+                  const prazo = String(
+                    Reflect.get(Object(semanaAtual || {}), "prazo_em") || ""
+                  );
+                  const semanaConcluida = semanaAtual?.status === "concluida";
 
-                  {(() => {
-                    const semanaAtual = semanasProjeto.find(
-                      (item) => item.semana === semanaFiltroProducao
-                    );
-                    const prazo = String(Reflect.get(Object(semanaAtual || {}), "prazo_em") || "");
-
-                    return (
-                      <>
-                        <span
-                          style={{
-                            borderRadius: 999,
-                            padding: "9px 12px",
-                            background:
-                              semanaAtual?.status === "concluida"
-                                ? "rgba(34,197,94,0.12)"
-                                : "rgba(56,189,248,0.12)",
-                            color:
-                              semanaAtual?.status === "concluida"
-                                ? "#86efac"
-                                : "#7dd3fc",
-                            border: "1px solid rgba(148,163,184,0.20)",
-                            fontSize: 12,
-                            fontWeight: 800,
-                          }}
+                  return (
+                    <>
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: isMobile
+                            ? "1fr"
+                            : "minmax(0, 1fr) auto auto",
+                          gap: 10,
+                          alignItems: "center",
+                          marginTop: 18,
+                        }}
+                      >
+                        <select
+                          value={semanaFiltroProducao}
+                          onChange={(e) =>
+                            setSemanaFiltroProducao(Number(e.target.value))
+                          }
+                          style={inputStyle}
                         >
-                          {semanaAtual?.status === "concluida"
-                            ? "Semana concluída"
-                            : "Semana aberta"}
-                        </span>
+                          {semanasProjeto
+                            .slice()
+                            .sort((a, b) => a.semana - b.semana)
+                            .map((semana) => (
+                              <option
+                                key={semana.id || semana.semana}
+                                value={semana.semana}
+                              >
+                                {labelSemana(semana.semana)}
+                              </option>
+                            ))}
+                        </select>
 
-                        {prazo && (
-                          <span style={{ color: "#94a3b8", fontSize: 13 }}>
-                            Prazo: {new Date(prazo).toLocaleString("pt-BR")}
-                          </span>
+                        {podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                          <button
+                            type="button"
+                            onClick={() => criarNovaSemanaProjeto(projetoPainel)}
+                            disabled={criandoSemanaProjeto}
+                            style={botaoPrimarioStyle}
+                          >
+                            {criandoSemanaProjeto
+                              ? "Criando..."
+                              : "+ Criar próxima semana"}
+                          </button>
                         )}
 
-                        {semanaAtual?.status !== "concluida" &&
-                          podeEditarProjeto(usuarioLogado, projetoPainel) && (
-                            <button
-                              type="button"
-                              disabled={liberandoSemana}
-                              onClick={() =>
-                                concluirSemanaAtualProjeto(projetoPainel)
-                              }
-                              style={botaoSecundarioStyle}
+                        {podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                          <button
+                            type="button"
+                            disabled={excluindoSemanaProjeto || liberandoSemana}
+                            onClick={() => excluirSemanaAtualProjeto(projetoPainel)}
+                            style={{
+                              ...botaoSecundarioStyle,
+                              color: "#fca5a5",
+                              border: "1px solid rgba(248,113,113,.34)",
+                              background: "rgba(220,38,38,.12)",
+                            }}
+                          >
+                            {excluindoSemanaProjeto
+                              ? "Excluindo..."
+                              : "Excluir semana"}
+                          </button>
+                        )}
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: 16,
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "flex-start",
+                          gap: 12,
+                          flexWrap: "wrap",
+                          padding: 16,
+                          borderRadius: 16,
+                          background: "rgba(2, 6, 23, 0.42)",
+                          border: "1px solid rgba(56,189,248,0.16)",
+                        }}
+                      >
+                        <div>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <strong style={{ color: "#f8fafc" }}>
+                              🎬 Produção — {labelSemana(semanaFiltroProducao)}
+                            </strong>
+
+                            <span
+                              style={{
+                                borderRadius: 999,
+                                padding: "8px 12px",
+                                background: semanaConcluida
+                                  ? "rgba(34,197,94,0.12)"
+                                  : "rgba(56,189,248,0.12)",
+                                color: semanaConcluida ? "#86efac" : "#7dd3fc",
+                                border: "1px solid rgba(148,163,184,0.20)",
+                                fontSize: 12,
+                                fontWeight: 800,
+                              }}
                             >
-                              {liberandoSemana
-                                ? "Concluindo..."
-                                : "Concluir semana"}
-                            </button>
+                              {semanaConcluida
+                                ? "Semana concluída"
+                                : "Semana aberta"}
+                            </span>
+                          </div>
+
+                          <div
+                            style={{
+                              color: "#94a3b8",
+                              fontSize: 13,
+                              marginTop: 6,
+                            }}
+                          >
+                            {participantesSemanaProjeto.length} participante(s)
+                            cadastrado(s) nesta semana.
+                          </div>
+
+                          {prazo && (
+                            <div
+                              style={{
+                                color: "#94a3b8",
+                                fontSize: 13,
+                                marginTop: 4,
+                              }}
+                            >
+                              Prazo: {new Date(prazo).toLocaleString("pt-BR")}
+                            </div>
                           )}
-                      </>
-                    );
-                  })()}
-                </div>
+                        </div>
 
-                <div
-                  style={{
-                    marginTop: 16,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 12,
-                    flexWrap: "wrap",
-                    padding: 16,
-                    borderRadius: 16,
-                    background: "rgba(2, 6, 23, 0.42)",
-                    border: "1px solid rgba(56,189,248,0.16)",
-                  }}
-                >
-                  <div>
-                    <strong style={{ color: "#f8fafc" }}>
-                      🎬 Produção — {labelSemana(semanaFiltroProducao)}
-                    </strong>
-                    <div style={{ color: "#94a3b8", fontSize: 13, marginTop: 4 }}>
-                      {participantesSemanaProjeto.length} participante(s)
-                      cadastrado(s) nesta semana.
-                    </div>
-                  </div>
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            flexWrap: "wrap",
+                            justifyContent: isMobile ? "stretch" : "flex-end",
+                          }}
+                        >
+                          {!semanaConcluida &&
+                            podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                              <button
+                                type="button"
+                                onClick={() => setMostrarAdicionarSemana(true)}
+                                disabled={alterandoParticipanteSemana}
+                                style={botaoSecundarioStyle}
+                              >
+                                + Adicionar dublador à semana
+                              </button>
+                            )}
 
-                </div>
+                          {!semanaConcluida &&
+                            podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                              <button
+                                type="button"
+                                disabled={liberandoSemana || excluindoSemanaProjeto}
+                                onClick={() =>
+                                  concluirSemanaAtualProjeto(projetoPainel)
+                                }
+                                style={botaoSecundarioStyle}
+                              >
+                                {liberandoSemana
+                                  ? "Concluindo..."
+                                  : "Concluir semana"}
+                              </button>
+                            )}
+
+                          {semanaConcluida &&
+                            podeEditarProjeto(usuarioLogado, projetoPainel) && (
+                              <button
+                                type="button"
+                                disabled={liberandoSemana || excluindoSemanaProjeto}
+                                onClick={() =>
+                                  reabrirSemanaAtualProjeto(projetoPainel)
+                                }
+                                style={{
+                                  ...botaoSecundarioStyle,
+                                  color: "#fde68a",
+                                  border: "1px solid rgba(245,158,11,.34)",
+                                  background: "rgba(245,158,11,.10)",
+                                }}
+                              >
+                                {liberandoSemana ? "Reabrindo..." : "Reabrir semana"}
+                              </button>
+                            )}
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
 
                 {(() => {
                   const elenco = participantesSemanaProjeto;
@@ -13637,145 +18133,580 @@ export default function DubworksManager() {
         </div>
       )}
 
-      {abaProjeto === "drive" && <DrivePanel />}
 
-      {abaProjeto === "registros" &&
-        (projetoPainel ? (
-          <div style={painelDarkStyle}>
-            <h2 style={tituloCardDarkStyle}>
-              ▣ Registros Semanais — {projetoPainel.Projeto}
-            </h2>
-            <p style={{ color: "#94a3b8", marginTop: 8 }}>
-              Cada registro salvo recebe automaticamente nome, data e hora.
-            </p>
+      {projetoPainel && abaProjeto === "registros" && (
+        <div style={painelDarkStyle}>
+          <h2 style={tituloCardDarkStyle}>
+            ▣ Registro — {projetoPainel.Projeto}
+          </h2>
+          <p style={{ color: "#94a3b8", marginTop: 8 }}>
+            Registre o andamento semanal do projeto. Esta área fica separada de Atividade e Histórico.
+          </p>
 
-            {(podeEditarProjeto(usuarioLogado, projetoPainel) ||
-              usuarioLogado?.cargo === "diretoria" ||
-              usuarioLogado?.cargo === "adm") && (
-              <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
-                <textarea
-                  placeholder="Escreva o registro semanal do projeto..."
-                  value={registroSemanalTexto}
-                  onChange={(e) => setRegistroSemanalTexto(e.target.value)}
-                  style={{ ...textareaStyle, minHeight: 110 }}
-                />
+          {(podeEditarProjeto(usuarioLogado, projetoPainel) ||
+            usuarioLogado?.cargo === "diretoria" ||
+            usuarioLogado?.cargo === "adm") && (
+            <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
+              <textarea
+                placeholder="Ex.: Semana 03 concluída, elenco enviou as falas, edição iniciada..."
+                value={registroSemanalTexto}
+                onChange={(e) => setRegistroSemanalTexto(e.target.value)}
+                style={{ ...textareaStyle, minHeight: 110 }}
+              />
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
                 <button
                   onClick={salvarRegistroSemanalProjeto}
                   style={botaoPrimarioStyle}
                 >
-                  Salvar registro semanal
+                  Salvar registro
                 </button>
               </div>
-            )}
-
-            <div
-              style={{
-                marginTop: 22,
-                background: "rgba(2,6,23,0.54)",
-                border: "1px solid rgba(148,163,184,0.14)",
-                borderRadius: 14,
-                padding: 16,
-                color: "#cbd5e1",
-                whiteSpace: "pre-wrap",
-                lineHeight: 1.6,
-              }}
-            >
-              {projetoPainel.Registro_Semanal ||
-                "Nenhum registro semanal cadastrado."}
             </div>
-          </div>
-        ) : (
-          <div style={painelDarkStyle}>
-            <h2 style={tituloCardDarkStyle}>▣ Registros Semanais</h2>
-            <p style={{ color: "#94a3b8" }}>
-              Selecione um projeto para incluir ou visualizar registros.
-            </p>
-          </div>
-        ))}
+          )}
 
-      {abaProjeto === "atividades" && (
-        <div style={painelDarkStyle}>
-          <h2 style={tituloCardDarkStyle}>🔔 Atividades do Projeto</h2>
-          <p style={{ color: "#94a3b8", marginTop: 8 }}>
-            Aqui aparecem somente atividades vinculadas ao projeto selecionado e
-            ao seu acesso.
-          </p>
-          <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
-            {notificacoesProjeto.map((item, index) => (
-              <div
-                key={`${item.usuario}-${index}`}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: isMobile ? "1fr" : "1fr auto",
-                  gap: 10,
-                  background: "rgba(2,6,23,0.54)",
-                  border: "1px solid rgba(56,189,248,0.14)",
-                  borderRadius: 14,
-                  padding: 14,
-                }}
-              >
-                <div>
-                  <strong style={{ color: "#f8fafc" }}>{item.usuario}</strong>
-                  <span style={{ color: "#cbd5e1" }}> - {item.acao}</span>
-                  <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>
-                    {item.tipo}
-                  </div>
-                </div>
-                <div style={{ color: "#94a3b8", fontSize: 13 }}>
-                  {item.data}
-                </div>
-              </div>
-            ))}
+          <div
+            style={{
+              marginTop: 22,
+              background: "rgba(2,6,23,0.54)",
+              border: "1px solid rgba(148,163,184,0.14)",
+              borderRadius: 14,
+              padding: 16,
+              color: "#cbd5e1",
+              whiteSpace: "pre-wrap",
+              lineHeight: 1.6,
+            }}
+          >
+            {registroSemRelatorios(projetoPainel.Registro_Semanal) ||
+              "Nenhum registro cadastrado."}
           </div>
         </div>
       )}
 
-      {abaProjeto === "historico" &&
-        (projetoPainel ? (
-          <div style={painelDarkStyle}>
-            <h2 style={tituloCardDarkStyle}>
-              ◷ Histórico de Alterações — {projetoPainel.Projeto}
-            </h2>
-            <p style={{ color: "#94a3b8", marginTop: 8 }}>
-              Histórico vinculado a este projeto. Toda ação salva fica
-              registrada aqui com data, hora e usuário.
-            </p>
-            <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
-              {(projetoPainel.Registro_Semanal
-                ? projetoPainel.Registro_Semanal.split("\n\n").filter(Boolean)
-                : []
-              ).map((item, index) => (
+      {projetoPainel && abaProjeto === "atividades" && (
+        <div style={painelDarkStyle}>
+          <h2 style={tituloCardDarkStyle}>↔ Atividade do Projeto</h2>
+          <p style={{ color: "#94a3b8", marginTop: 8 }}>
+            Atividades recentes vinculadas ao projeto selecionado.
+          </p>
+          <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
+            {notificacoesProjeto.length ? (
+              notificacoesProjeto.map((item, index) => (
                 <div
-                  key={`${projetoPainel.ID}-historico-${index}`}
+                  key={`${item.usuario}-${index}`}
                   style={{
+                    display: "grid",
+                    gridTemplateColumns: isMobile ? "1fr" : "1fr auto",
+                    gap: 10,
                     background: "rgba(2,6,23,0.54)",
-                    border: "1px solid rgba(148,163,184,0.14)",
+                    border: "1px solid rgba(56,189,248,0.14)",
                     borderRadius: 14,
                     padding: 14,
+                  }}
+                >
+                  <div>
+                    <strong style={{ color: "#f8fafc" }}>{item.usuario}</strong>
+                    <span style={{ color: "#cbd5e1" }}> — {item.acao}</span>
+                    <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>
+                      {item.tipo}
+                    </div>
+                  </div>
+                  <div style={{ color: "#94a3b8", fontSize: 13 }}>{item.data}</div>
+                </div>
+              ))
+            ) : (
+              <div style={{ color: "#94a3b8" }}>Nenhuma atividade recente.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {projetoPainel && abaProjeto === "historico" && (
+        <div style={painelDarkStyle}>
+          <h2 style={tituloCardDarkStyle}>
+            ◷ Histórico — {projetoPainel.Projeto}
+          </h2>
+          <p style={{ color: "#94a3b8", marginTop: 8 }}>
+            Alterações e registros preservados do projeto, separados da área de atividade.
+          </p>
+          <div style={{ display: "grid", gap: 10, marginTop: 18 }}>
+            {separarHistoricoProjeto(
+              registroSemRelatorios(projetoPainel.Registro_Semanal)
+            ).map((item, index) => (
+              <div
+                key={`${projetoPainel.ID}-historico-${index}`}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "auto minmax(0,1fr)",
+                  gap: 12,
+                  alignItems: "flex-start",
+                  background: "rgba(2,6,23,0.54)",
+                  border: "1px solid rgba(148,163,184,0.14)",
+                  borderRadius: 14,
+                  padding: 14,
+                }}
+              >
+                <div
+                  style={{
+                    width: 32,
+                    height: 32,
+                    borderRadius: 10,
+                    display: "grid",
+                    placeItems: "center",
+                    background: "rgba(14,165,233,.12)",
+                    color: "#7dd3fc",
+                    border: "1px solid rgba(56,189,248,.16)",
+                  }}
+                >
+                  ◷
+                </div>
+                <div
+                  style={{
                     color: "#cbd5e1",
                     whiteSpace: "pre-wrap",
+                    lineHeight: 1.55,
+                    overflowWrap: "anywhere",
                   }}
                 >
                   {item}
                 </div>
-              ))}
-              {!projetoPainel.Registro_Semanal && (
-                <div style={{ color: "#94a3b8" }}>
-                  Nenhum histórico salvo para este projeto ainda.
+              </div>
+            ))}
+            {!registroSemRelatorios(projetoPainel.Registro_Semanal) && (
+              <div style={{ color: "#94a3b8" }}>Nenhum histórico salvo ainda.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {projetoPainel && abaProjeto === "relatorios" && (() => {
+        const relatorios = lerRelatoriosProjeto(projetoPainel.Registro_Semanal);
+        const pendenciasSubstituicao = relatorios.flatMap((relatorio) =>
+          (relatorio.itens || [])
+            .filter((item) => item.status === "precisa_substituir")
+            .map((item) => ({ relatorio, item }))
+        );
+
+        return (
+          <div
+            data-tutorial-projetos="relatorios-projeto"
+            style={{ display: "grid", gap: 18 }}
+          >
+            {pendenciasSubstituicao.length > 0 && (
+              <div
+                style={{
+                  ...painelDarkStyle,
+                  border: "1px solid rgba(245,158,11,.34)",
+                  background: "rgba(120,53,15,.12)",
+                }}
+              >
+                <h2 style={tituloCardDarkStyle}>⚠ Substituições necessárias</h2>
+                <p style={{ color: "#fcd34d", marginTop: 8 }}>
+                  Pendências identificadas nos relatórios semanais.
+                </p>
+                <div style={{ display: "grid", gap: 10, marginTop: 14 }}>
+                  {pendenciasSubstituicao.map(({ relatorio, item }, index) => (
+                    <div
+                      key={`${relatorio.id}-${item.personagem}-${index}`}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 12,
+                        flexWrap: "wrap",
+                        borderRadius: 12,
+                        padding: 12,
+                        background: "rgba(2,6,23,.44)",
+                        border: "1px solid rgba(245,158,11,.22)",
+                      }}
+                    >
+                      <div>
+                        <strong>{item.personagem}</strong>
+                        <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4 }}>
+                          {labelSemana(relatorio.semana || 1)} • {item.dublador || "Sem dublador"}
+                        </div>
+                      </div>
+                      {usuarioLogado?.cargo === "diretoria" && (
+                        <button
+                          type="button"
+                          onClick={() => void abrirVagaEmergencialPorRelatorio(item)}
+                          style={botaoPrimarioStyle}
+                        >
+                          Abrir vaga emergencial
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={painelDarkStyle}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h2 style={tituloCardDarkStyle}>▥ Relatório do projeto</h2>
+                  <p style={{ color: "#94a3b8", margin: "6px 0 0" }}>
+                    A atividade semanal é calculada automaticamente. Materiais concluídos continuam podendo ser registrados manualmente.
+                  </p>
+                </div>
+                <select
+                  value={tipoRelatorioProjeto}
+                  onChange={(e) =>
+                    setTipoRelatorioProjeto(e.target.value as "semanal" | "material")
+                  }
+                  style={{ ...inputStyle, minWidth: 220 }}
+                >
+                  <option value="semanal">Atividade semanal automática</option>
+                  <option value="material">Material/projeto concluído</option>
+                </select>
+              </div>
+
+              {tipoRelatorioProjeto === "semanal" ? (
+                <div style={{ display: "grid", gap: 16, marginTop: 18 }}>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: isMobile ? "1fr" : "minmax(0,1fr) auto",
+                      gap: 10,
+                    }}
+                  >
+                    <select
+                      value={semanaRelatorioProjeto}
+                      onChange={(e) => {
+                        const semana = Number(e.target.value);
+                        setSemanaRelatorioProjeto(semana);
+                        void carregarItensRelatorioSemana(projetoPainel, semana);
+                      }}
+                      style={inputStyle}
+                    >
+                      {semanasProjeto.length ? (
+                        semanasProjeto.map((semana) => (
+                          <option key={semana.id || semana.semana} value={semana.semana}>
+                            {labelSemana(semana.semana)} • {semana.status === "aberta" ? "Aberta" : "Concluída"}
+                          </option>
+                        ))
+                      ) : (
+                        <option value={1}>Semana 01</option>
+                      )}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void carregarItensRelatorioSemana(
+                          projetoPainel,
+                          semanaRelatorioProjeto
+                        )
+                      }
+                      style={botaoSecundarioStyle}
+                    >
+                      ↻ Atualizar agora
+                    </button>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "11px 13px",
+                      borderRadius: 13,
+                      border: "1px solid rgba(59,130,246,.20)",
+                      background: "rgba(30,64,175,.10)",
+                      color: "#bfdbfe",
+                      fontSize: 12,
+                    }}
+                  >
+                    <span style={{ fontSize: 17 }}>✦</span>
+                    <span>
+                      <strong>Relatório automático.</strong> Os números abaixo são calculados a partir do elenco vinculado à semana e das entregas registradas no sistema.
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: isMobile
+                        ? "repeat(2,minmax(0,1fr))"
+                        : "repeat(6,minmax(110px,1fr))",
+                      gap: 10,
+                    }}
+                  >
+                    {[
+                      ["👥", resumoRelatorioAutomaticoProjeto.previstos, "Previstos", "#60a5fa"],
+                      ["📥", resumoRelatorioAutomaticoProjeto.entregaram, "Entregaram", "#38bdf8"],
+                      ["⚠", resumoRelatorioAutomaticoProjeto.naoEntregaram, "Não entregaram", "#fb7185"],
+                      ["⌛", resumoRelatorioAutomaticoProjeto.pendentes, "Aguardando análise", "#fbbf24"],
+                      ["✓", resumoRelatorioAutomaticoProjeto.aprovados, "Aprovados", "#4ade80"],
+                      ["↻", resumoRelatorioAutomaticoProjeto.regravacoes, "Regravações", "#a78bfa"],
+                    ].map(([icone, valor, label, cor]) => (
+                      <div
+                        key={String(label)}
+                        style={{
+                          padding: "13px 12px",
+                          borderRadius: 14,
+                          border: "1px solid rgba(148,163,184,.14)",
+                          background: "rgba(2,6,23,.40)",
+                        }}
+                      >
+                        <div style={{ color: String(cor), fontSize: 16, marginBottom: 5 }}>{icone}</div>
+                        <div style={{ color: "#f8fafc", fontSize: 21, fontWeight: 950 }}>{valor}</div>
+                        <div style={{ color: "#94a3b8", fontSize: 10, marginTop: 2 }}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: isMobile ? "1fr" : "repeat(2,minmax(0,1fr))",
+                      gap: 12,
+                    }}
+                  >
+                    {[
+                      ["Recebimento da semana", resumoRelatorioAutomaticoProjeto.progressoRecebimento, "entregas recebidas"],
+                      ["Aprovação da semana", resumoRelatorioAutomaticoProjeto.progressoAprovacao, "entregas aprovadas"],
+                    ].map(([label, valor, detalhe]) => (
+                      <div
+                        key={String(label)}
+                        style={{
+                          padding: 14,
+                          borderRadius: 14,
+                          border: "1px solid rgba(148,163,184,.14)",
+                          background: "rgba(2,6,23,.34)",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                          <strong style={{ color: "#e2e8f0", fontSize: 12 }}>{label}</strong>
+                          <strong style={{ color: "#93c5fd", fontSize: 12 }}>{valor}%</strong>
+                        </div>
+                        <div
+                          style={{
+                            height: 7,
+                            background: "rgba(30,41,59,.90)",
+                            borderRadius: 999,
+                            overflow: "hidden",
+                            marginTop: 9,
+                          }}
+                        >
+                          <div
+                            style={{
+                              height: "100%",
+                              width: `${Math.max(0, Math.min(100, Number(valor)))}%`,
+                              borderRadius: 999,
+                              background: "linear-gradient(90deg,#2563eb,#38bdf8)",
+                            }}
+                          />
+                        </div>
+                        <div style={{ color: "#64748b", fontSize: 9, marginTop: 6 }}>{detalhe}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid rgba(148,163,184,.14)",
+                      borderRadius: 14,
+                      overflow: "hidden",
+                      background: "rgba(2,6,23,.34)",
+                    }}
+                  >
+                    {!isMobile && itensRelatorioProjeto.length > 0 && (
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "minmax(160px,1fr) minmax(160px,1fr) 180px minmax(170px,1.2fr)",
+                          gap: 10,
+                          padding: "10px 13px",
+                          color: "#64748b",
+                          fontSize: 9,
+                          fontWeight: 900,
+                          textTransform: "uppercase",
+                          letterSpacing: ".06em",
+                          borderBottom: "1px solid rgba(148,163,184,.12)",
+                        }}
+                      >
+                        <span>Personagem</span>
+                        <span>Dublador</span>
+                        <span>Situação</span>
+                        <span>Observação da entrega</span>
+                      </div>
+                    )}
+                    {itensRelatorioProjeto.length ? (
+                      itensRelatorioProjeto.map((item, index) => {
+                        const info = infoStatusRelatorioAutomatico(item.status);
+                        return (
+                          <div
+                            key={`${item.personagem}-${item.dublador}-${index}`}
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns: isMobile
+                                ? "1fr"
+                                : "minmax(160px,1fr) minmax(160px,1fr) 180px minmax(170px,1.2fr)",
+                              gap: isMobile ? 7 : 10,
+                              alignItems: "center",
+                              padding: "12px 13px",
+                              borderBottom:
+                                index === itensRelatorioProjeto.length - 1
+                                  ? "none"
+                                  : "1px solid rgba(148,163,184,.10)",
+                            }}
+                          >
+                            <div>
+                              {isMobile && <div style={{ color: "#64748b", fontSize: 9 }}>Personagem</div>}
+                              <strong style={{ color: "#f8fafc", fontSize: 12 }}>{item.personagem || "—"}</strong>
+                            </div>
+                            <div>
+                              {isMobile && <div style={{ color: "#64748b", fontSize: 9 }}>Dublador</div>}
+                              <span style={{ color: "#cbd5e1", fontSize: 12 }}>{item.dublador || "—"}</span>
+                            </div>
+                            <div>
+                              <span
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  padding: "6px 9px",
+                                  borderRadius: 999,
+                                  color: info.color,
+                                  background: info.bg,
+                                  fontSize: 10,
+                                  fontWeight: 900,
+                                }}
+                              >
+                                {info.icon} {info.label}
+                              </span>
+                            </div>
+                            <div style={{ color: item.observacao ? "#94a3b8" : "#475569", fontSize: 10 }}>
+                              {item.observacao || "—"}
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div style={{ color: "#94a3b8", padding: 18 }}>
+                        Nenhum participante vinculado a esta semana. O relatório continuará vazio até o elenco ser adicionado à semana.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 12, marginTop: 18 }}>
+                  <input
+                    value={materialNomeRelatorioProjeto}
+                    onChange={(e) => setMaterialNomeRelatorioProjeto(e.target.value)}
+                    placeholder="Ex.: Episódio 01 finalizado"
+                    style={inputStyle}
+                  />
+                  <input
+                    value={materialLinkRelatorioProjeto}
+                    onChange={(e) => setMaterialLinkRelatorioProjeto(e.target.value)}
+                    placeholder="Link do material finalizado"
+                    style={inputStyle}
+                  />
+                  <textarea
+                    value={materialObservacaoRelatorioProjeto}
+                    onChange={(e) => setMaterialObservacaoRelatorioProjeto(e.target.value)}
+                    placeholder="Observações sobre a entrega"
+                    style={{ ...textareaStyle, minHeight: 90 }}
+                  />
+                </div>
+              )}
+
+              {tipoRelatorioProjeto === "material" && (
+                <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+                  <button
+                    type="button"
+                    disabled={salvandoRelatorioProjeto}
+                    onClick={() => void salvarRelatorioProjetoAtual()}
+                    style={botaoPrimarioStyle}
+                  >
+                    {salvandoRelatorioProjeto ? "Salvando..." : "Salvar material concluído"}
+                  </button>
                 </div>
               )}
             </div>
-          </div>
-        ) : (
-          <div style={painelDarkStyle}>
-            <h2 style={tituloCardDarkStyle}>◷ Histórico de Alterações</h2>
-            <p style={{ color: "#94a3b8" }}>
-              Selecione um projeto para visualizar o histórico dele.
-            </p>
-          </div>
-        ))}
 
-      {projetoPainel && ProjectList()}
+            <div style={painelDarkStyle}>
+              <h2 style={tituloCardDarkStyle}>Relatórios salvos</h2>
+              <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
+                {relatorios.length ? (
+                  relatorios.map((relatorio) => (
+                    <details
+                      key={relatorio.id}
+                      style={{
+                        borderRadius: 14,
+                        border: "1px solid rgba(148,163,184,.16)",
+                        background: "rgba(2,6,23,.44)",
+                        padding: 14,
+                      }}
+                    >
+                      <summary style={{ cursor: "pointer", fontWeight: 800 }}>
+                        {relatorio.tipo === "semanal"
+                          ? `${labelSemana(relatorio.semana || 1)} — Relatório semanal`
+                          : relatorio.materialNome || "Material concluído"}
+                        <span style={{ color: "#64748b", fontWeight: 500 }}>
+                          {` • ${new Date(relatorio.criadoEm).toLocaleDateString("pt-BR")} • ${relatorio.criadoPor}`}
+                        </span>
+                      </summary>
+
+                      {relatorio.tipo === "semanal" ? (
+                        <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+                          {(relatorio.itens || []).map((item, index) => (
+                            <div
+                              key={`${item.personagem}-${index}`}
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 180px",
+                                gap: 10,
+                                color: "#cbd5e1",
+                              }}
+                            >
+                              <span><strong>{item.personagem}</strong></span>
+                              <span>{item.dublador || "—"}</span>
+                              <span>{item.status.replace(/_/g, " ")}</span>
+                            </div>
+                          ))}
+                          {relatorio.andamento && <div>Andamento: {relatorio.andamento}</div>}
+                          {relatorio.dificuldades && <div>Dificuldades: {relatorio.dificuldades}</div>}
+                          {relatorio.suporte && <div>Suporte: {relatorio.suporte}</div>}
+                          {relatorio.observacoes && <div>Observações: {relatorio.observacoes}</div>}
+                        </div>
+                      ) : (
+                        <div style={{ display: "grid", gap: 8, marginTop: 12, color: "#cbd5e1" }}>
+                          {relatorio.materialLink && (
+                            <a
+                              href={relatorio.materialLink}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ color: "#7dd3fc" }}
+                            >
+                              Abrir material ↗
+                            </a>
+                          )}
+                          {relatorio.materialObservacao && (
+                            <div>{relatorio.materialObservacao}</div>
+                          )}
+                        </div>
+                      )}
+                    </details>
+                  ))
+                ) : (
+                  <div style={{ color: "#94a3b8" }}>Nenhum relatório salvo ainda.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+
 
     </div>
   );
@@ -13794,6 +18725,157 @@ export default function DubworksManager() {
     >
       <style>{estilosAnimacao}</style>
 
+      {tutorialProjetoAtivo && (
+        <>
+          <div
+            style={{
+              position: "fixed",
+              inset: 0,
+              zIndex: 1990,
+              background: "rgba(2,6,23,.62)",
+              pointerEvents: "none",
+            }}
+          />
+
+          {tutorialProjetoRect && (
+            <div
+              style={{
+                position: "fixed",
+                zIndex: 1995,
+                left: Math.max(8, tutorialProjetoRect.left - 8),
+                top: Math.max(8, tutorialProjetoRect.top - 8),
+                width: Math.max(40, tutorialProjetoRect.width + 16),
+                height: Math.max(40, tutorialProjetoRect.height + 16),
+                borderRadius: 16,
+                border: "3px solid #60a5fa",
+                boxShadow:
+                  "0 0 0 9999px rgba(2,6,23,.16), 0 0 34px rgba(59,130,246,.85)",
+                pointerEvents: "none",
+                transition: "all .22s ease",
+              }}
+            />
+          )}
+
+          <div
+            style={{
+              position: "fixed",
+              zIndex: 2005,
+              right: isMobile ? 12 : 24,
+              bottom: isMobile ? 12 : 24,
+              left: isMobile ? 12 : "auto",
+              width: isMobile ? "auto" : 390,
+              borderRadius: 18,
+              border: "1px solid rgba(96,165,250,.42)",
+              background:
+                "linear-gradient(180deg, rgba(9,22,46,.99), rgba(5,15,34,.99))",
+              boxShadow: "0 24px 70px rgba(0,0,0,.55)",
+              padding: 18,
+              pointerEvents: "auto",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                alignItems: "flex-start",
+              }}
+            >
+              <div>
+                <div style={{ color: "#60a5fa", fontSize: 12, fontWeight: 900 }}>
+                  Treinamento na prática • Passo {tutorialProjetoPasso + 1} de {TUTORIAL_PROJETO_PASSOS.length}
+                </div>
+                <h3 style={{ color: "#f8fafc", margin: "7px 0 6px", fontSize: 19 }}>
+                  {TUTORIAL_PROJETO_PASSOS[tutorialProjetoPasso]?.titulo}
+                </h3>
+                <p style={{ color: "#cbd5e1", lineHeight: 1.55, margin: 0 }}>
+                  {TUTORIAL_PROJETO_PASSOS[tutorialProjetoPasso]?.texto}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={encerrarTutorialPraticoProjetos}
+                aria-label="Fechar tutorial"
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: 10,
+                  border: "1px solid rgba(148,163,184,.22)",
+                  background: "rgba(15,23,42,.74)",
+                  color: "#cbd5e1",
+                  cursor: "pointer",
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: `repeat(${TUTORIAL_PROJETO_PASSOS.length}, minmax(0,1fr))`,
+                gap: 5,
+                marginTop: 16,
+              }}
+            >
+              {TUTORIAL_PROJETO_PASSOS.map((_, index) => (
+                <div
+                  key={index}
+                  style={{
+                    height: 4,
+                    borderRadius: 999,
+                    background:
+                      index <= tutorialProjetoPasso ? "#3b82f6" : "rgba(148,163,184,.22)",
+                  }}
+                />
+              ))}
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 10,
+                marginTop: 16,
+              }}
+            >
+              <button
+                type="button"
+                disabled={tutorialProjetoPasso === 0}
+                onClick={() => void prepararPassoTutorialProjeto(tutorialProjetoPasso - 1)}
+                style={{
+                  ...botaoSecundarioStyle,
+                  opacity: tutorialProjetoPasso === 0 ? .45 : 1,
+                }}
+              >
+                ← Anterior
+              </button>
+
+              {tutorialProjetoPasso < TUTORIAL_PROJETO_PASSOS.length - 1 ? (
+                <button
+                  type="button"
+                  onClick={() => void prepararPassoTutorialProjeto(tutorialProjetoPasso + 1)}
+                  style={botaoPrimarioStyle}
+                >
+                  Próximo →
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    encerrarTutorialPraticoProjetos();
+                    abrirTelaTreinamentos();
+                    setModuloTreinamentoAtivo("pratica-projetos");
+                  }}
+                  style={botaoPrimarioStyle}
+                >
+                  Concluir treinamento
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      )}
 
       {mostrarNotificacoesChat && (
         <>
@@ -15891,7 +20973,7 @@ export default function DubworksManager() {
           }}
           largo
         >
-          <div style={{ display: "grid", gap: 18 }}>
+          <div data-tutorial-projetos="form-novo-projeto" style={{ display: "grid", gap: 18 }}>
             <div
               style={{
                 display: "grid",
@@ -15899,54 +20981,315 @@ export default function DubworksManager() {
                 gap: 14,
               }}
             >
-              {[
-                ["Nome do projeto", "Projeto"],
-                ["Tipo", "Tipo"],
-                ["Gênero", "Genero"],
-                ["Prioridade", "Prioridade"],
-                ["Dupla", "Dupla"],
-                ["Líder", "Lider"],
-                ["Telefone do líder", "Telefone_Lider"],
-                ["Editor", "Editor"],
-                ["Telefone do editor", "Telefone_Editor"],
-                ["Status", "Status"],
-                ["Data de início", "Data_Inicio"],
-                ["Capa do projeto (URL)", "Capa_URL"],
-              ].map(([label, campo]) => (
-                <div key={campo}>
-                  <label style={labelStyle}>{label}</label>
-                  {campo === "Status" ? (
-                    <select
-                      value={String((novoProjeto as any)[campo] || "")}
-                      onChange={(e) =>
-                        setNovoProjeto((anterior) => ({
-                          ...anterior,
-                          [campo]: e.target.value,
-                        }))
-                      }
-                      style={inputStyle}
-                    >
-                      <option value="">Selecione o status</option>
-                      {STATUS_PROJETO_OPCOES.map((status) => (
-                        <option key={status} value={status}>
-                          {status}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      value={String((novoProjeto as any)[campo] || "")}
-                      onChange={(e) =>
-                        setNovoProjeto((anterior) => ({
-                          ...anterior,
-                          [campo]: e.target.value,
-                        }))
-                      }
-                      style={inputStyle}
-                    />
-                  )}
+              <div>
+                <label style={labelStyle}>Nome do projeto *</label>
+                <input
+                  value={novoProjeto.Projeto || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Projeto: e.target.value,
+                    }))
+                  }
+                  placeholder="Nome do projeto"
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={labelStyle}>Tipo do projeto *</label>
+                <select
+                  value={novoProjeto.Tipo || "Projeto"}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Tipo: e.target.value,
+                    }))
+                  }
+                  style={inputStyle}
+                >
+                  {TIPO_PROJETO_OPCOES.map((tipo) => (
+                    <option key={tipo} value={tipo}>{tipo}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label style={labelStyle}>Gênero *</label>
+                <select
+                  value={novoProjeto.Genero || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Genero: e.target.value,
+                    }))
+                  }
+                  style={{
+                    ...inputStyle,
+                    borderColor:
+                      tentouCriarProjeto && !novoProjeto.Genero.trim()
+                        ? "rgba(248,113,113,.72)"
+                        : inputStyle.borderColor,
+                  }}
+                >
+                  <option value="">Selecione o gênero</option>
+                  {GENERO_PROJETO_OPCOES.map((genero) => (
+                    <option key={genero} value={genero}>{genero}</option>
+                  ))}
+                </select>
+                {tentouCriarProjeto && !novoProjeto.Genero.trim() && (
+                  <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                    Gênero é obrigatório.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label style={labelStyle}>Categoria *</label>
+                <select
+                  value={novoProjetoCategoria}
+                  onChange={(e) => setNovoProjetoCategoria(e.target.value)}
+                  style={{
+                    ...inputStyle,
+                    borderColor:
+                      tentouCriarProjeto && !novoProjetoCategoria.trim()
+                        ? "rgba(248,113,113,.72)"
+                        : inputStyle.borderColor,
+                  }}
+                >
+                  <option value="">Selecione a categoria</option>
+                  {CATEGORIA_PROJETO_OPCOES.map((categoria) => (
+                    <option key={categoria} value={categoria}>{categoria}</option>
+                  ))}
+                </select>
+                {tentouCriarProjeto && !novoProjetoCategoria.trim() && (
+                  <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                    Categoria é obrigatória.
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label style={labelStyle}>Prioridade</label>
+                <input
+                  value={novoProjeto.Prioridade || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Prioridade: e.target.value,
+                    }))
+                  }
+                  placeholder="Prioridade do projeto"
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={labelStyle}>Nome do líder *</label>
+                <input
+                  value={novoProjetoNomeLider}
+                  onChange={(e) => setNovoProjetoNomeLider(e.target.value)}
+                  placeholder="Nome do líder"
+                  inputMode="text"
+                  autoComplete="off"
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={labelStyle}>Nome do editor</label>
+                <input
+                  value={novoProjetoNomeEditor}
+                  onChange={(e) => setNovoProjetoNomeEditor(e.target.value)}
+                  placeholder="Nome do editor"
+                  inputMode="text"
+                  autoComplete="off"
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={labelStyle}>E-mail do líder *</label>
+                <input
+                  value={novoProjeto.Lider || ""}
+                  onChange={(e) => {
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Lider: e.target.value,
+                    }));
+                    setErroEmailLiderNovo("");
+                  }}
+                  placeholder="email@exemplo.com"
+                  inputMode="email"
+                  autoComplete="off"
+                  style={{
+                    ...inputStyle,
+                    borderColor: erroEmailLiderNovo
+                      ? "rgba(248,113,113,.72)"
+                      : inputStyle.borderColor,
+                  }}
+                />
+                {validandoEmailLiderNovo && (
+                  <div style={{ color: "#93c5fd", fontSize: 12, marginTop: 6 }}>
+                    Verificando usuário...
+                  </div>
+                )}
+                {erroEmailLiderNovo && (
+                  <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                    {erroEmailLiderNovo}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label style={labelStyle}>E-mail do editor</label>
+                <input
+                  value={novoProjeto.Editor || ""}
+                  onChange={(e) => {
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Editor: e.target.value,
+                    }));
+                    setErroEmailEditorNovo("");
+                  }}
+                  placeholder="email@exemplo.com"
+                  inputMode="email"
+                  autoComplete="off"
+                  style={{
+                    ...inputStyle,
+                    borderColor: erroEmailEditorNovo
+                      ? "rgba(248,113,113,.72)"
+                      : inputStyle.borderColor,
+                  }}
+                />
+                {validandoEmailEditorNovo && (
+                  <div style={{ color: "#93c5fd", fontSize: 12, marginTop: 6 }}>
+                    Verificando usuário...
+                  </div>
+                )}
+                {erroEmailEditorNovo && (
+                  <div style={{ color: "#fca5a5", fontSize: 12, marginTop: 6 }}>
+                    {erroEmailEditorNovo}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label style={labelStyle}>Telefone do líder *</label>
+                <input
+                  value={novoProjeto.Telefone_Lider || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Telefone_Lider: e.target.value,
+                    }))
+                  }
+                  placeholder="[00] 00000-0000"
+                  inputMode="tel"
+                  style={inputStyle}
+                />
+              </div>
+
+              <div>
+                <label style={labelStyle}>Telefone do editor</label>
+                <input
+                  value={novoProjeto.Telefone_Editor || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Telefone_Editor: e.target.value,
+                    }))
+                  }
+                  placeholder="[00] 00000-0000"
+                  inputMode="tel"
+                  style={inputStyle}
+                />
+              </div>
+
+            </div>
+
+            <div style={painelDarkStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <label style={labelStyle}>Capa do projeto</label>
+                  <div style={{ color: "#94a3b8", fontSize: 12, marginTop: -2 }}>
+                    Você pode enviar uma imagem ou usar uma URL.
+                  </div>
                 </div>
-              ))}
+                {novoProjeto.Capa_URL && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setNovoProjeto((anterior) => ({ ...anterior, Capa_URL: "" }))
+                    }
+                    style={botaoSecundarioStyle}
+                  >
+                    Remover capa
+                  </button>
+                )}
+              </div>
+
+              {novoProjeto.Capa_URL && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    height: isMobile ? 160 : 220,
+                    borderRadius: 14,
+                    overflow: "hidden",
+                    border: "1px solid rgba(148,163,184,.16)",
+                    background: `url(${novoProjeto.Capa_URL}) center/cover`,
+                  }}
+                />
+              )}
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 1fr) auto",
+                  gap: 10,
+                  marginTop: 12,
+                  alignItems: "center",
+                }}
+              >
+                <input
+                  value={novoProjeto.Capa_URL || ""}
+                  onChange={(e) =>
+                    setNovoProjeto((anterior) => ({
+                      ...anterior,
+                      Capa_URL: e.target.value,
+                    }))
+                  }
+                  placeholder="Cole a URL da imagem da capa"
+                  inputMode="url"
+                  autoComplete="off"
+                  style={inputStyle}
+                />
+
+                <label
+                  style={{
+                    ...botaoSecundarioStyle,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    minHeight: 44,
+                    cursor: enviandoCapaNovoProjeto ? "wait" : "pointer",
+                    opacity: enviandoCapaNovoProjeto ? 0.7 : 1,
+                  }}
+                >
+                  {enviandoCapaNovoProjeto ? "Enviando capa..." : "Enviar arquivo"}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    disabled={enviandoCapaNovoProjeto}
+                    onChange={(e) => {
+                      const arquivo = e.target.files?.[0] || null;
+                      void enviarCapaNovoProjeto(arquivo);
+                      e.currentTarget.value = "";
+                    }}
+                    style={{ display: "none" }}
+                  />
+                </label>
+              </div>
             </div>
 
             <div>
@@ -15969,8 +21312,9 @@ export default function DubworksManager() {
                 Banco inicial de personagens
               </h3>
               <p style={{ color: "#94a3b8", margin: "0 0 14px" }}>
-                Apenas o personagem é obrigatório. Dublador, número/ID e função
-                podem ser definidos depois.
+                Cadastre os personagens antes de criar a estrutura do Drive. Essa mesma lista
+                será enviada para os menus de personagem dos formulários de seleção e entrega.
+                Dublador e telefone podem ser preenchidos depois.
               </p>
 
               <div
@@ -15978,7 +21322,7 @@ export default function DubworksManager() {
                   display: "grid",
                   gridTemplateColumns: isMobile
                     ? "1fr"
-                    : "repeat(5, minmax(0, 1fr))",
+                    : "repeat(3, minmax(0, 1fr)) auto",
                   gap: 12,
                 }}
               >
@@ -15994,7 +21338,7 @@ export default function DubworksManager() {
                   style={inputStyle}
                 />
                 <input
-                  placeholder="Dublador (opcional)"
+                  placeholder="Nome do dublador"
                   value={novoElencoProjeto.dublador}
                   onChange={(e) =>
                     setNovoElencoProjeto((anterior) => ({
@@ -16005,23 +21349,12 @@ export default function DubworksManager() {
                   style={inputStyle}
                 />
                 <input
-                  placeholder="Número / ID (opcional)"
+                  placeholder="[00] 00000-0000"
                   value={novoElencoProjeto.telefone_dublador || ""}
                   onChange={(e) =>
                     setNovoElencoProjeto((anterior) => ({
                       ...anterior,
                       telefone_dublador: e.target.value,
-                    }))
-                  }
-                  style={inputStyle}
-                />
-                <input
-                  placeholder="Função (opcional)"
-                  value={novoElencoProjeto.funcao}
-                  onChange={(e) =>
-                    setNovoElencoProjeto((anterior) => ({
-                      ...anterior,
-                      funcao: e.target.value,
                     }))
                   }
                   style={inputStyle}
@@ -16054,8 +21387,8 @@ export default function DubworksManager() {
                         <strong>{item.personagem}</strong>
                         <span style={{ color: "#94a3b8" }}>
                           {" "}
-                          — {item.dublador || "Papel aberto"}{" "}
-                          {item.funcao ? `(${item.funcao})` : ""}
+                          — {item.dublador || "Papel aberto"}
+                          {item.telefone_dublador ? ` • ${item.telefone_dublador}` : ""}
                         </span>
                       </div>
                       <button
@@ -16638,6 +21971,68 @@ select {
   background: rgba(2, 6, 23, 0.88) !important;
   color: #f8fafc !important;
   border-color: rgba(148, 163, 184, 0.24) !important;
+}
+
+/* Tags da Central de Membros: estas classes têm especificidade maior que
+   o estilo global de select acima, por isso as cores realmente aparecem. */
+.dw-member-tag-select {
+  border-radius: 999px !important;
+  font-weight: 900 !important;
+}
+.dw-member-status-nao_definido {
+  background: rgba(100, 116, 139, .30) !important;
+  color: #e2e8f0 !important;
+  border-color: rgba(148, 163, 184, .40) !important;
+}
+.dw-member-status-na_comunidade {
+  background: rgba(22, 163, 74, .38) !important;
+  color: #bbf7d0 !important;
+  border-color: rgba(34, 197, 94, .60) !important;
+}
+.dw-member-status-somente_canais {
+  background: rgba(2, 132, 199, .38) !important;
+  color: #bae6fd !important;
+  border-color: rgba(56, 189, 248, .58) !important;
+}
+.dw-member-status-saiu {
+  background: rgba(234, 88, 12, .36) !important;
+  color: #fed7aa !important;
+  border-color: rgba(249, 115, 22, .58) !important;
+}
+.dw-member-status-banido {
+  background: rgba(220, 38, 38, .38) !important;
+  color: #fecaca !important;
+  border-color: rgba(248, 113, 113, .62) !important;
+}
+.dw-member-status-pausado {
+  background: rgba(202, 138, 4, .36) !important;
+  color: #fef3c7 !important;
+  border-color: rgba(250, 204, 21, .54) !important;
+}
+.dw-member-atendimento-chamar {
+  background: rgba(217, 119, 6, .38) !important;
+  color: #fef3c7 !important;
+  border-color: rgba(245, 158, 11, .60) !important;
+}
+.dw-member-atendimento-01 {
+  background: rgba(37, 99, 235, .42) !important;
+  color: #dbeafe !important;
+  border-color: rgba(96, 165, 250, .62) !important;
+}
+.dw-member-atendimento-02 {
+  background: rgba(124, 58, 237, .42) !important;
+  color: #ede9fe !important;
+  border-color: rgba(167, 139, 250, .62) !important;
+}
+.dw-member-atendimento-concluido {
+  background: rgba(22, 163, 74, .38) !important;
+  color: #bbf7d0 !important;
+  border-color: rgba(34, 197, 94, .60) !important;
+}
+.dw-member-atendimento-erro {
+  background: rgba(220, 38, 38, .38) !important;
+  color: #fecaca !important;
+  border-color: rgba(248, 113, 113, .62) !important;
 }
 
 option {

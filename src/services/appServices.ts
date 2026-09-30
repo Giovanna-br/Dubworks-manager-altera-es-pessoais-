@@ -1,11 +1,15 @@
-import { supabase } from "../lib/supabase";
-import { FORMS_COPIER_URL, permissoesDisponiveis } from "../config/appConfig";
+import { createClient } from "@supabase/supabase-js";
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from "../lib/supabase";
+import { guardedFetch, assertWritable } from "../lib/safeFetch";
+import { DRIVE_PROXY_FUNCTION_NAME, FORMS_PROXY_ENABLED, FORMS_PROXY_FUNCTION_NAME, permissoesDisponiveis } from "../config/appConfig";
 import type {
+  AtendimentoMembro,
   AvaliacaoSelecao,
   Cargo,
   ChavePermissao,
   ElencoItem,
   EntregaProducao,
+  HistoricoMembroEvento,
   Membro,
   Projeto,
   ProjetoSemana,
@@ -20,6 +24,22 @@ import type {
 } from "../types";
 
 
+
+export {
+  permissaoPadraoPorCargo,
+  temAcesso,
+  permissoesPadraoUsuario,
+  podeVerProjeto,
+  podeEditarProjeto,
+  podeCriarProjeto,
+  podeSubirVideoEditor,
+  podeGerenciarUsuarios,
+  podeGerenciarMembros,
+  podeGerenciarTreinamentos,
+  podeVerNotificacoesGerais,
+  podeExcluirUsuario,
+  cargosPermitidosParaCriar,
+} from "../security/permissions";
 
 // =========================================================
 // ADVERTÊNCIAS — GOOGLE FORMS / PLANILHA GESTÃO DUBWORKS
@@ -162,7 +182,7 @@ export async function carregarAdvertenciasPlanilha(): Promise<
     throw new Error("Sua sessão expirou. Entre novamente no DubWorks Manager.");
   }
 
-  const response = await fetch(apiUrl, {
+  const response = await guardedFetch(apiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "text/plain;charset=utf-8",
@@ -448,246 +468,55 @@ export function statusTreinamentoLabel(status?: TrainingStatus) {
 
 export function statusMembroLabel(status?: StatusMembro) {
   const labels: Record<StatusMembro, string> = {
-    na_comunidade: "Na comunidade",
+    nao_definido: "Não definido",
+    na_comunidade: "Comunidade",
+    somente_canais: "Canais",
     saiu: "Saiu",
-    banido: "Banido",
+    banido: "Ban",
     pausado: "Pausado",
   };
-  return labels[status || "na_comunidade"];
+  return labels[status || "nao_definido"];
 }
 
 export function corStatusMembro(status?: StatusMembro) {
-  const s = status || "na_comunidade";
+  const s = status || "nao_definido";
   if (s === "na_comunidade")
-    return { bg: "rgba(8,116,67,0.22)", color: "#087443" };
-  if (s === "saiu") return { bg: "rgba(180,83,9,0.22)", color: "#f59e0b" };
-  if (s === "banido") return { bg: "rgba(194,65,12,0.22)", color: "#fb7185" };
-  return { bg: "rgba(37,99,235,0.20)", color: "#93c5fd" };
+    return { bg: "rgba(59,130,246,0.18)", color: "#93c5fd" };
+  if (s === "somente_canais")
+    return { bg: "rgba(125,211,252,0.18)", color: "#7dd3fc" };
+  if (s === "saiu")
+    return { bg: "rgba(248,113,113,0.18)", color: "#fca5a5" };
+  if (s === "banido")
+    return { bg: "rgba(239,68,68,0.22)", color: "#fecaca" };
+  if (s === "pausado")
+    return { bg: "rgba(168,85,247,0.16)", color: "#d8b4fe" };
+  return { bg: "rgba(148,163,184,0.14)", color: "#cbd5e1" };
+}
+
+export function atendimentoMembroLabel(status?: AtendimentoMembro | string | null) {
+  const s = String(status || "chamar").toLowerCase();
+  if (s === "01" || s === "1") return "01";
+  if (s === "02" || s === "2") return "02";
+  if (s === "concluido" || s === "concluído") return "Concluído";
+  if (s === "erro") return "Erro";
+  return "Chamar";
+}
+
+export function corAtendimentoMembro(status?: AtendimentoMembro | string | null) {
+  const s = String(status || "chamar").toLowerCase();
+  if (s === "01" || s === "1")
+    return { bg: "rgba(253,230,138,0.18)", color: "#fde68a" };
+  if (s === "02" || s === "2")
+    return { bg: "rgba(254,240,138,0.14)", color: "#fef3c7" };
+  if (s === "concluido" || s === "concluído")
+    return { bg: "rgba(34,197,94,0.16)", color: "#86efac" };
+  if (s === "erro")
+    return { bg: "rgba(239,68,68,0.16)", color: "#fca5a5" };
+  return { bg: "rgba(245,158,11,0.16)", color: "#fde68a" };
 }
 
 export function statusPadraoPorCargo(cargo: Cargo): TrainingStatus {
   return cargo === "lider_treinamento" ? "em_andamento" : "nao_aplicavel";
-}
-
-export function permissaoPadraoPorCargo(cargo: Cargo, chave: ChavePermissao) {
-  if (cargo === "diretoria") return true;
-
-  if (cargo === "adm") {
-    return [
-      "acesso_projetos",
-      "acesso_membros",
-      "acesso_usuarios",
-      "acesso_advertencias",
-      "acesso_relatorios_projetos",
-      "acesso_relatorios_elenco",
-      "acesso_exportacoes",
-    ].includes(chave);
-  }
-
-  if (cargo === "adm_treinamento") {
-    return ["acesso_usuarios", "acesso_treinamentos"].includes(chave);
-  }
-
-  if (cargo === "moderador") {
-    return ["acesso_membros", "acesso_advertencias"].includes(chave);
-  }
-
-  if (cargo === "analista_rr") {
-    return [
-      "acesso_membros",
-      "acesso_relatorios_membros",
-      "acesso_relatorios_entrada_saida",
-    ].includes(chave);
-  }
-
-  if (cargo === "marketing") {
-    return ["acesso_projetos_finalizados"].includes(chave);
-  }
-
-  if (cargo === "eventos") {
-    return ["acesso_projetos", "acesso_eventos"].includes(chave);
-  }
-
-  if (cargo === "lider" || cargo === "lider_treinamento") {
-    return [
-      "acesso_projetos",
-      "acesso_relatorios_elenco",
-      "acesso_exportacoes",
-    ].includes(chave);
-  }
-
-  if (cargo === "editor") {
-    return ["acesso_projetos"].includes(chave);
-  }
-
-  return false;
-}
-
-export function temAcesso(usuario: Usuario | null, chave: ChavePermissao) {
-  if (!usuario) return false;
-  if (usuario.cargo === "diretoria") return true;
-
-  const valor = usuario[chave];
-  if (typeof valor === "boolean") return valor;
-
-  return permissaoPadraoPorCargo(usuario.cargo, chave);
-}
-
-export function permissoesPadraoUsuario(cargo: Cargo) {
-  return permissoesDisponiveis.reduce((acc, item) => {
-    acc[item.chave] = permissaoPadraoPorCargo(cargo, item.chave);
-    return acc;
-  }, {} as Record<ChavePermissao, boolean>);
-}
-
-export function podeVerProjeto(usuario: Usuario | null, projeto: Projeto) {
-  if (!usuario) return false;
-
-  const cargo = normalizar(usuario.cargo);
-  const vinculo = normalizar(usuario.vinculo);
-  const login = normalizar(usuario.login);
-  const nome = normalizar(usuario.nome);
-  const lider = normalizar(projeto.Lider);
-  const editor = normalizar(projeto.Editor);
-
-  if (cargo === "marketing") {
-    return (
-      temAcesso(usuario, "acesso_projetos_finalizados") &&
-      normalizar(projeto.Status) === "finalizado"
-    );
-  }
-
-  if (!temAcesso(usuario, "acesso_projetos")) return false;
-
-  if (["diretoria", "adm", "adm_treinamento"].indexOf(cargo) !== -1) {
-    return true;
-  }
-
-  if (cargo === "eventos") return true;
-
-  if (cargo === "lider" || cargo === "lider_treinamento") {
-    if (!lider) return false;
-    return [vinculo, login, nome].filter(Boolean).includes(lider);
-  }
-
-  if (cargo === "editor") {
-    if (!editor) return false;
-    return [vinculo, login, nome].filter(Boolean).includes(editor);
-  }
-
-  return false;
-}
-
-export function podeEditarProjeto(usuario: Usuario | null, projeto: Projeto | null) {
-  if (!usuario || !projeto) return false;
-
-  const cargo = normalizar(usuario.cargo);
-  const vinculo = normalizar(usuario.vinculo);
-  const login = normalizar(usuario.login);
-  const nome = normalizar(usuario.nome);
-  const lider = normalizar(projeto.Lider);
-
-  if (cargo === "diretoria" || cargo === "adm") return true;
-
-  if (cargo === "lider" || cargo === "lider_treinamento") {
-    if (!lider) return false;
-    return [vinculo, login, nome].filter(Boolean).includes(lider);
-  }
-
-  return false;
-}
-
-export function podeCriarProjeto(usuario: Usuario | null) {
-  if (!usuario) return false;
-  return (
-    ["diretoria", "adm", "lider", "lider_treinamento"].indexOf(
-      usuario.cargo
-    ) !== -1
-  );
-}
-
-export function podeSubirVideoEditor(
-  usuario: Usuario | null,
-  projeto: Projeto | null
-) {
-  if (!usuario || !projeto) return false;
-
-  const cargo = normalizar(usuario.cargo);
-  const vinculo = normalizar(usuario.vinculo);
-  const login = normalizar(usuario.login);
-  const nome = normalizar(usuario.nome);
-  const editor = normalizar(projeto.Editor);
-
-  if (["diretoria", "adm"].indexOf(cargo) !== -1) return true;
-  if (cargo === "editor") {
-    if (!editor) return false;
-    return [vinculo, login, nome].filter(Boolean).includes(editor);
-  }
-  return false;
-}
-
-export function podeGerenciarUsuarios(usuario: Usuario | null) {
-  return temAcesso(usuario, "acesso_usuarios");
-}
-
-export function podeGerenciarMembros(usuario: Usuario | null) {
-  return temAcesso(usuario, "acesso_membros");
-}
-
-export function podeGerenciarTreinamentos(usuario: Usuario | null) {
-  return temAcesso(usuario, "acesso_treinamentos");
-}
-
-export function podeVerNotificacoesGerais(usuario: Usuario | null) {
-  if (!usuario) return false;
-  return usuario.cargo === "diretoria" || usuario.cargo === "adm";
-}
-
-export function podeExcluirUsuario(usuarioLogado: Usuario | null, alvo: Usuario) {
-  if (!usuarioLogado) return false;
-  if (alvo.cargo === "diretoria" && usuarioLogado.cargo !== "diretoria")
-    return false;
-  if (usuarioLogado.cargo === "diretoria") return true;
-  if (usuarioLogado.cargo === "adm") return alvo.cargo !== "diretoria";
-  if (usuarioLogado.cargo === "adm_treinamento") {
-    return alvo.cargo === "lider_treinamento";
-  }
-  return false;
-}
-
-export function cargosPermitidosParaCriar(usuario: Usuario | null): Cargo[] {
-  if (!usuario) return [];
-  if (usuario.cargo === "diretoria") {
-    return [
-      "diretoria",
-      "adm",
-      "adm_treinamento",
-      "moderador",
-      "analista_rr",
-      "marketing",
-      "eventos",
-      "lider",
-      "lider_treinamento",
-      "editor",
-      "membro",
-    ];
-  }
-  if (usuario.cargo === "adm") {
-    return [
-      "moderador",
-      "analista_rr",
-      "marketing",
-      "eventos",
-      "lider",
-      "lider_treinamento",
-      "editor",
-      "membro",
-    ];
-  }
-  if (usuario.cargo === "adm_treinamento") {
-    return ["lider_treinamento"];
-  }
-  return [];
 }
 
 export function corStatus(status: string) {
@@ -732,7 +561,6 @@ export function mapUsuarioDb(item: any): Usuario {
     id: item.id,
     nome: item.nome || "",
     login: item.login || "",
-    senha: item.senha || null,
     cargo: normalizar(item.cargo) as Cargo,
     vinculo: item.vinculo || "",
     training_status: (item.training_status ||
@@ -794,11 +622,17 @@ export function mapMembroDb(item: any): Membro {
     email: item.email || "",
     data_nascimento: item.data_nascimento || null,
     idade: item.idade ?? null,
+    faixa_etaria: item.faixa_etaria || "",
+    idade_inconsistente: Boolean(item.idade_inconsistente),
     habilidades: item.habilidades || "",
     motivacao: item.motivacao || "",
-    status: (item.status_comunidade ||
+    status: (item.participacao ||
+      item.status_comunidade ||
       item.status ||
-      "na_comunidade") as StatusMembro,
+      "nao_definido") as StatusMembro,
+    atendimento: item.atendimento || "chamar",
+    movimentacao: item.movimentacao || "",
+    data_ficha: item.data_ficha || item.timestamp || null,
     data_entrada: item.data_entrada || null,
     data_saida: item.data_saida || null,
     observacao: item.observacao || "",
@@ -1891,51 +1725,158 @@ export async function criarEstruturaDriveViaFunction(
   leaderEmail = "",
   editorEmail = ""
 ): Promise<DriveStructureResult> {
-  const response = await fetch(
-    "https://omgjbafqukpzdhhpdlaa.supabase.co/functions/v1/google-drive-create-structure",
+  const { data, error } = await supabase.functions.invoke(
+    DRIVE_PROXY_FUNCTION_NAME,
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: "sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-        Authorization: "Bearer sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-      },
-      body: JSON.stringify({
+      body: {
+        action: "criar_estrutura_drive",
         projectName: projetoNome,
         leaderEmail,
         editorEmail,
         folders: ["1 | Seleção", "2 | Projeto", "3 | Finalizado"],
-      }),
+      },
     }
   );
 
-  const data = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    console.error("Erro da Edge Function Google Drive:", data);
+  if (error) {
+    const detalhe = await extrairMensagemErroFunctions(error);
+    console.error("Erro da Edge Function Google Drive:", error, detalhe);
     throw new Error(
-      data?.error ||
-        data?.message ||
-        `Edge Function retornou erro HTTP ${response.status}`
+      `Não foi possível criar a estrutura do Drive: ${detalhe}`
     );
   }
 
   if (!data) {
-    throw new Error("A Edge Function não retornou dados.");
+    throw new Error("A Edge Function do Drive não retornou dados.");
   }
 
-  if (data.error) {
-    console.error("Erro retornado pela Edge Function:", data);
-    throw new Error(String(data.error));
+  if (data.ok === false || data.error) {
+    console.error("Erro retornado pela Edge Function do Drive:", data);
+    throw new Error(
+      String(data.error || data.message || "Erro na integração Google Drive")
+    );
   }
 
   return data as DriveStructureResult;
 }
 
+export async function compartilharPastaDriveComUsuario(
+  pastaIdOuUrl: string,
+  email: string
+): Promise<boolean> {
+  const folderId = extrairGoogleFolderId(pastaIdOuUrl);
+  const emailNormalizado = String(email || "").trim().toLowerCase();
+
+  if (!folderId || !emailNormalizado) return false;
+
+  const { data, error } = await supabase.functions.invoke(
+    DRIVE_PROXY_FUNCTION_NAME,
+    {
+      body: {
+        action: "compartilhar_pasta",
+        folderId,
+        email: emailNormalizado,
+        role: "writer",
+      },
+    }
+  );
+
+  if (error) {
+    const detalhe = await extrairMensagemErroFunctions(error);
+    console.error("Erro ao compartilhar a pasta do projeto no Drive:", error, detalhe);
+    throw new Error(
+      `Não foi possível liberar acesso à pasta: ${detalhe}`
+    );
+  }
+
+  if (data?.ok === false || data?.error) {
+    throw new Error(
+      String(data.error || data.message || "Não foi possível liberar acesso à pasta.")
+    );
+  }
+
+  return true;
+}
+
+export type OpcoesFormulariosProjeto = {
+  projectId?: string;
+  projectType?: string;
+  mainFolderId?: string;
+  formSelecao?: string;
+  formEntregas?: string;
+  semanasAbertas?: string[];
+};
+
+function integracaoFormsNovaConfigurada() {
+  return FORMS_PROXY_ENABLED && Boolean(FORMS_PROXY_FUNCTION_NAME);
+}
+
+async function extrairMensagemErroFunctions(error: any): Promise<string> {
+  let detalhe = String(error?.message || "Falha desconhecida ao chamar o backend.");
+
+  // O SDK da Supabase guarda a Response HTTP em error.context.
+  // Tentamos ler uma cópia para mostrar o erro real retornado pela Edge Function.
+  try {
+    const context = error?.context;
+    if (context && typeof context.clone === "function") {
+      const cloned = context.clone();
+      const corpo = await cloned.json().catch(() => null);
+      detalhe = String(corpo?.error || corpo?.message || detalhe);
+    }
+  } catch {
+    // Mantém a mensagem original do SDK.
+  }
+
+  return detalhe;
+}
+
+async function chamarAppsScriptFormularios(
+  payload: Record<string, unknown>
+): Promise<any> {
+  if (!integracaoFormsNovaConfigurada()) {
+    throw new Error(
+      "A integração Google Forms está desativada. Ative VITE_DUBWORKS_FORMS_PROXY_ENABLED e implante a função google-forms-proxy."
+    );
+  }
+
+  // IMPORTANTE: o navegador NÃO chama mais script.google.com diretamente.
+  // Frontend -> Supabase Edge Function -> Apps Script -> Google Forms.
+  // Isso elimina o bloqueio CORS do Apps Script no localhost e na produção.
+  const { data, error } = await supabase.functions.invoke(
+    FORMS_PROXY_FUNCTION_NAME,
+    {
+      body: payload,
+    }
+  );
+
+  if (error) {
+    const detalhe = await extrairMensagemErroFunctions(error);
+    console.error("Erro no proxy dos formulários (Supabase):", error, detalhe);
+    throw new Error(
+      `Não foi possível acessar a integração Google Forms pelo backend: ${detalhe}`
+    );
+  }
+
+  if (!data) {
+    throw new Error("O proxy do Google Forms não retornou dados.");
+  }
+
+  if (data.ok === false || data.error) {
+    console.error("Erro retornado pela integração Google Forms:", data);
+    throw new Error(
+      String(data.error || data.message || "Erro na integração Google Forms")
+    );
+  }
+
+  return data;
+}
+
 export async function copiarFormulariosViaAppsScript(
   projetoNome: string,
   respostasSelecaoFolderId?: string,
-  entregasFolderId?: string
+  entregasFolderId?: string,
+  personagens: string[] = [],
+  opcoes: OpcoesFormulariosProjeto = {}
 ): Promise<Partial<DriveStructureResult>> {
   if (!respostasSelecaoFolderId || !entregasFolderId) {
     console.warn("Pastas para formulários ausentes:", {
@@ -1945,37 +1886,34 @@ export async function copiarFormulariosViaAppsScript(
     return {};
   }
 
-  const response = await fetch(FORMS_COPIER_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain;charset=utf-8",
-    },
-    body: JSON.stringify({
-      projectName: projetoNome,
-      respostasSelecaoFolderId,
-      entregasFolderId,
-    }),
-  });
+  const payload: Record<string, unknown> = integracaoFormsNovaConfigurada()
+    ? {
+        action: "preparar_formularios_projeto",
+        projectId: opcoes.projectId || "",
+        projectName: projetoNome,
+        projectType: opcoes.projectType || "Projeto",
+        mainFolderId: opcoes.mainFolderId || "",
+        respostasSelecaoFolderId,
+        entregasFolderId,
+        existingSelectionFormId: extrairGoogleFileId(opcoes.formSelecao || ""),
+        existingDeliveriesFormId: extrairGoogleFileId(opcoes.formEntregas || ""),
+        personagens,
+        personagensSelecao: personagens,
+        // Entregas não depende de personagem; a identificação é telefone + semana.
+        semanasAbertas: opcoes.semanasAbertas || [],
+      }
+    : {
+        // Compatibilidade com o Apps Script antigo enquanto a nova implantação
+        // ainda não estiver configurada no .env.local.
+        projectName: projetoNome,
+        respostasSelecaoFolderId,
+        entregasFolderId,
+        personagens,
+        personagensSelecao: personagens,
+        personagensEntregas: personagens,
+      };
 
-  const data = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    console.error("Erro ao chamar Apps Script dos formulários:", data);
-    throw new Error(
-      data?.error ||
-        data?.message ||
-        `Apps Script retornou erro HTTP ${response.status}`
-    );
-  }
-
-  if (!data) {
-    throw new Error("O Apps Script não retornou dados.");
-  }
-
-  if (data.error) {
-    console.error("Erro retornado pelo Apps Script:", data);
-    throw new Error(String(data.error));
-  }
+  const data = await chamarAppsScriptFormularios(payload);
 
   return {
     formSelecao: data.formSelecao?.editUrl || data.formSelecao?.viewUrl || "",
@@ -1987,6 +1925,204 @@ export async function copiarFormulariosViaAppsScript(
     planilhaSelecaoId: data.planilhaSelecao?.id || "",
     planilhaEntregas: data.planilhaEntregas?.url || "",
     planilhaEntregasId: data.planilhaEntregas?.id || "",
+  };
+}
+
+export async function sincronizarFormularioEntregasViaAppsScript(
+  formIdOuUrl: string,
+  semanasAbertas: string[]
+): Promise<boolean> {
+  if (!integracaoFormsNovaConfigurada()) return false;
+  const formId = extrairGoogleFileId(formIdOuUrl);
+  if (!formId) return false;
+
+  await chamarAppsScriptFormularios({
+    action: "sincronizar_form_entregas",
+    formId,
+    semanasAbertas,
+  });
+  return true;
+}
+
+export async function sincronizarFormularioSelecaoViaAppsScript(
+  formIdOuUrl: string,
+  personagens: string[]
+): Promise<boolean> {
+  if (!integracaoFormsNovaConfigurada()) return false;
+  const formId = extrairGoogleFileId(formIdOuUrl);
+  if (!formId) return false;
+
+  await chamarAppsScriptFormularios({
+    action: "sincronizar_form_selecao",
+    formId,
+    personagens,
+    personagensSelecao: personagens,
+  });
+  return true;
+}
+
+export type TelefoneProjetoNormalizado = {
+  original: string;
+  completo: string;
+  local: string;
+  possuiDDD: boolean;
+};
+
+export function normalizarTelefoneProjeto(
+  valor?: string | null
+): TelefoneProjetoNormalizado {
+  const original = String(valor || "").trim();
+  let digitos = original.replace(/\D/g, "");
+
+  if (digitos.startsWith("00")) digitos = digitos.slice(2);
+  if (
+    (digitos.length === 12 || digitos.length === 13) &&
+    digitos.startsWith("55")
+  ) {
+    digitos = digitos.slice(2);
+  }
+  if (digitos.length === 12 && digitos.startsWith("0")) {
+    digitos = digitos.slice(1);
+  }
+
+  if (digitos.length === 10 || digitos.length === 11) {
+    return {
+      original,
+      completo: digitos,
+      local: digitos.slice(2),
+      possuiDDD: true,
+    };
+  }
+
+  if (digitos.length === 8 || digitos.length === 9) {
+    return {
+      original,
+      completo: "",
+      local: digitos,
+      possuiDDD: false,
+    };
+  }
+
+  return {
+    original,
+    completo: digitos.length >= 10 ? digitos : "",
+    local: digitos.length > 9 ? digitos.slice(-9) : digitos,
+    possuiDDD: digitos.length >= 10,
+  };
+}
+
+function variantesNumeroLocal(numero: string) {
+  const base = String(numero || "").replace(/\D/g, "");
+  const variantes = new Set<string>();
+  if (!base) return variantes;
+  variantes.add(base);
+
+  // Compatibilidade com cadastros antigos sem o nono dígito.
+  if (base.length === 9 && base.startsWith("9")) {
+    variantes.add(base.slice(1));
+  }
+  if (base.length === 8 && /^[6-9]/.test(base)) {
+    variantes.add(`9${base}`);
+  }
+  return variantes;
+}
+
+export type ResolucaoTelefoneEntrega = {
+  status: "vinculado" | "nao_encontrado" | "ambiguo" | "telefone_invalido";
+  participante?: ParticipanteSemanaProjeto;
+  candidatos: ParticipanteSemanaProjeto[];
+  telefoneNormalizado: string;
+  detalhe: string;
+};
+
+export function resolverParticipanteEntregaPorTelefone(
+  telefone: string,
+  participantes: ParticipanteSemanaProjeto[]
+): ResolucaoTelefoneEntrega {
+  const entrada = normalizarTelefoneProjeto(telefone);
+  const dedupe = (lista: ParticipanteSemanaProjeto[]) => {
+    const mapa = new Map<string, ParticipanteSemanaProjeto>();
+    lista.forEach((item) => {
+      const chave = [
+        normalizar(item.personagem),
+        normalizar(item.dublador),
+        normalizarTelefoneProjeto(item.telefone_dublador).completo ||
+          normalizarTelefoneProjeto(item.telefone_dublador).local,
+      ].join("|");
+      if (!mapa.has(chave)) mapa.set(chave, item);
+    });
+    return Array.from(mapa.values());
+  };
+
+  if (!entrada.completo && !entrada.local) {
+    return {
+      status: "telefone_invalido",
+      candidatos: [],
+      telefoneNormalizado: "",
+      detalhe: "O telefone informado não possui dígitos suficientes.",
+    };
+  }
+
+  let candidatos: ParticipanteSemanaProjeto[] = [];
+
+  if (entrada.completo) {
+    candidatos = participantes.filter((item) => {
+      const cadastrado = normalizarTelefoneProjeto(item.telefone_dublador);
+      if (cadastrado.completo === entrada.completo) return true;
+
+      // Caso um cadastro antigo tenha 8 dígitos e o outro 9, compara também
+      // as variantes locais, mas mantém o mesmo DDD.
+      if (
+        cadastrado.completo &&
+        cadastrado.completo.slice(0, 2) === entrada.completo.slice(0, 2)
+      ) {
+        const locaisEntrada = variantesNumeroLocal(entrada.local);
+        const locaisCadastrado = variantesNumeroLocal(cadastrado.local);
+        return Array.from(locaisEntrada).some((v) => locaisCadastrado.has(v));
+      }
+      return false;
+    });
+  } else {
+    const locaisEntrada = variantesNumeroLocal(entrada.local);
+    candidatos = participantes.filter((item) => {
+      const cadastrado = normalizarTelefoneProjeto(item.telefone_dublador);
+      const locaisCadastrado = variantesNumeroLocal(cadastrado.local);
+      return Array.from(locaisEntrada).some((v) => locaisCadastrado.has(v));
+    });
+  }
+
+  candidatos = dedupe(candidatos);
+
+  if (!candidatos.length) {
+    return {
+      status: "nao_encontrado",
+      candidatos: [],
+      telefoneNormalizado: entrada.completo || entrada.local,
+      detalhe: entrada.possuiDDD
+        ? "Nenhum participante da semana possui este telefone."
+        : "Nenhum participante da semana possui este número local.",
+    };
+  }
+
+  if (candidatos.length > 1) {
+    return {
+      status: "ambiguo",
+      candidatos,
+      telefoneNormalizado: entrada.completo || entrada.local,
+      detalhe: entrada.possuiDDD
+        ? "O mesmo telefone está associado a mais de um personagem nesta semana."
+        : "O número foi informado sem DDD e corresponde a mais de uma pessoa/personagem nesta semana.",
+    };
+  }
+
+  return {
+    status: "vinculado",
+    participante: candidatos[0],
+    candidatos,
+    telefoneNormalizado: entrada.completo || entrada.local,
+    detalhe: entrada.possuiDDD
+      ? "Participante localizado pelo telefone."
+      : "Participante localizado pelo número local sem DDD; havia uma única correspondência na semana.",
   };
 }
 
@@ -2039,41 +2175,50 @@ export async function lerRespostasSelecaoViaAppsScript(
     );
   }
 
-  const response = await fetch(
-    "https://omgjbafqukpzdhhpdlaa.supabase.co/functions/v1/google-drive-create-structure",
+  if (spreadsheetId && integracaoFormsNovaConfigurada()) {
+    try {
+      const direto = await chamarAppsScriptFormularios({
+        action: "ler_respostas_selecao",
+        spreadsheetId,
+      });
+      return (direto.respostas || []).map((item: any, index: number) => ({
+        id: String(item.id || item.linha || index + 1),
+        linha: Number(item.linha || index + 2),
+        timestamp: item.timestamp || item.data || "",
+        nome: item.nome || item.membro || "",
+        telefone: item.telefone || item.numero || item.whatsapp || "",
+        personagem: item.personagem || "",
+        semana: item.semana || "Semana 01",
+        videoUrl: item.videoUrl || item.video || item.envio || item.link || "",
+        comentario: item.comentario || item.observacao || "",
+        status: (item.status || "pendente") as StatusSelecao,
+      }));
+    } catch (erro) {
+      console.warn(
+        "Leitura direta pelo Apps Script falhou; tentando Edge Function antiga.",
+        erro
+      );
+    }
+  }
+
+  const { data, error } = await supabase.functions.invoke(
+    DRIVE_PROXY_FUNCTION_NAME,
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: "sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-        Authorization: "Bearer sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-      },
-      body: JSON.stringify({
+      body: {
         action: "ler_respostas_selecao",
         spreadsheetId,
         folderId,
-      }),
+      },
     }
   );
 
-  const data = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    console.error("Erro ao ler respostas pela Edge Function:", data);
-    throw new Error(
-      data?.error ||
-        data?.message ||
-        `Edge Function retornou erro HTTP ${response.status}`
-    );
+  if (error) {
+    const detalhe = await extrairMensagemErroFunctions(error);
+    throw new Error(`Não foi possível ler respostas da Seleção: ${detalhe}`);
   }
-
-  if (!data) {
-    throw new Error("A Edge Function não retornou dados.");
-  }
-
-  if (data.error) {
-    console.error("Erro retornado pela Edge Function:", data);
-    throw new Error(String(data.error));
+  if (!data) throw new Error("A integração de Seleção não retornou dados.");
+  if (data.ok === false || data.error) {
+    throw new Error(String(data.error || data.message || "Erro ao ler respostas da Seleção."));
   }
 
   return (data.respostas || []).map((item: any, index: number) => ({
@@ -2150,36 +2295,55 @@ export async function lerRespostasEntregasViaEdge(
     );
   }
 
-  const response = await fetch(
-    "https://omgjbafqukpzdhhpdlaa.supabase.co/functions/v1/google-drive-create-structure",
+  if (spreadsheetId && integracaoFormsNovaConfigurada()) {
+    try {
+      const direto = await chamarAppsScriptFormularios({
+        action: "ler_respostas_entregas",
+        spreadsheetId,
+      });
+      return (direto.respostas || []).map((item: any, index: number) => ({
+        projeto_id: 0,
+        resposta_id: String(item.id || item.linha || index + 1),
+        linha: Number(item.linha || index + 2),
+        personagem: item.personagem || "",
+        dublador: item.dublador || item.nome || item.membro || "",
+        telefone: item.telefone || item.numero || item.whatsapp || "",
+        semana: item.semana || "Semana 01",
+        video_url: item.videoUrl || item.video || item.envio || item.link || "",
+        comentario: item.comentario || item.observacao || "",
+        status: (item.status || "pendente") as
+          | "pendente"
+          | "aprovado"
+          | "regravacao",
+        data_envio: item.timestamp || item.data || "",
+      }));
+    } catch (erro) {
+      console.warn(
+        "Leitura direta de entregas pelo Apps Script falhou; tentando Edge Function antiga.",
+        erro
+      );
+    }
+  }
+
+  const { data, error } = await supabase.functions.invoke(
+    DRIVE_PROXY_FUNCTION_NAME,
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: "sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-        Authorization: "Bearer sb_publishable_3bAOHbPjpV5RMnqb-cJKRA_cB1okqvT",
-      },
-      body: JSON.stringify({
+      body: {
         action: "ler_respostas_entregas",
         spreadsheetId,
         folderId,
-      }),
+      },
     }
   );
 
-  const data = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    console.error("Erro ao ler entregas pela Edge Function:", data);
-    throw new Error(
-      data?.error ||
-        data?.message ||
-        `Edge Function retornou erro HTTP ${response.status}`
-    );
+  if (error) {
+    const detalhe = await extrairMensagemErroFunctions(error);
+    throw new Error(`Não foi possível ler respostas de Entregas: ${detalhe}`);
   }
-
-  if (!data) throw new Error("A Edge Function não retornou dados.");
-  if (data.error) throw new Error(String(data.error));
+  if (!data) throw new Error("A integração de Entregas não retornou dados.");
+  if (data.ok === false || data.error) {
+    throw new Error(String(data.error || data.message || "Erro ao ler respostas de Entregas."));
+  }
 
   return (data.respostas || []).map((item: any, index: number) => ({
     projeto_id: 0,
@@ -2366,6 +2530,296 @@ export interface ParticipanteSemanaProjeto {
   criado_em: string;
 }
 
+export type SituacaoAtividadeSemanal =
+  | "normal"
+  | "atencao"
+  | "critico"
+  | "aguardando_analise"
+  | "regravacao"
+  | "sem_dados"
+  | "concluida";
+
+export interface ParticipanteAtividadeSemanal {
+  personagem: string;
+  dublador: string;
+  telefone: string;
+  status: "nao_entregou" | "aguardando_analise" | "aprovado" | "regravacao";
+  data_envio?: string | null;
+  data_avaliacao?: string | null;
+  comentario?: string | null;
+}
+
+export interface AtividadeSemanalProjeto {
+  projetoId: string;
+  projeto: string;
+  lider: string;
+  editor: string;
+  statusProjeto: string;
+  semana: number | null;
+  semanaStatus: "aberta" | "concluida" | null;
+  abertaEm?: string | null;
+  prazoEm?: string | null;
+  ultimaAtividade?: string | null;
+  previstos: number;
+  entregaram: number;
+  naoEntregaram: number;
+  pendentes: number;
+  aprovados: number;
+  regravacoes: number;
+  progressoRecebimento: number;
+  progressoAprovacao: number;
+  situacao: SituacaoAtividadeSemanal;
+  participantes: ParticipanteAtividadeSemanal[];
+}
+
+function telefoneRelatorio(valor?: string | null) {
+  return String(valor || "").replace(/\D/g, "");
+}
+
+function timestampRelatorio(valor?: string | null) {
+  if (!valor) return 0;
+  const data = new Date(valor);
+  return Number.isNaN(data.getTime()) ? 0 : data.getTime();
+}
+
+function dataMaisRecenteRelatorio(valores: Array<string | null | undefined>) {
+  const validos = valores
+    .filter((valor): valor is string => Boolean(valor))
+    .map((valor) => ({ valor, tempo: timestampRelatorio(valor) }))
+    .filter((item) => item.tempo > 0)
+    .sort((a, b) => b.tempo - a.tempo);
+  return validos[0]?.valor || null;
+}
+
+export async function carregarAtividadeSemanalProjetosBanco(
+  projetos: Projeto[]
+): Promise<AtividadeSemanalProjeto[]> {
+  const projetosValidos = projetos.filter((projeto) => {
+    const id = Number(projeto.ID);
+    return Number.isFinite(id) && id > 0;
+  });
+
+  if (!projetosValidos.length) return [];
+
+  const projetoIds = projetosValidos.map((projeto) => Number(projeto.ID));
+
+  const [{ data: semanasRaw, error: erroSemanas }, { data: entregasRaw, error: erroEntregas }] =
+    await Promise.all([
+      supabase
+        .from("projeto_semanas")
+        .select("*")
+        .in("projeto_id", projetoIds)
+        .order("semana", { ascending: false }),
+      supabase
+        .from("entregas_producao")
+        .select("*")
+        .in("projeto_id", projetoIds),
+    ]);
+
+  if (erroSemanas) {
+    console.error("Erro ao carregar semanas para atividade semanal:", erroSemanas);
+  }
+  if (erroEntregas) {
+    console.error("Erro ao carregar entregas para atividade semanal:", erroEntregas);
+  }
+
+  const semanas = (semanasRaw || []) as Array<ProjetoSemana & { prazo_em?: string | null }>;
+  const entregas = (entregasRaw || []) as Array<EntregaProducao & {
+    criado_em?: string | null;
+    atualizado_em?: string | null;
+  }>;
+
+  const semanaAtualPorProjeto = new Map<number, ProjetoSemana & { prazo_em?: string | null }>();
+
+  for (const projeto of projetosValidos) {
+    const id = Number(projeto.ID);
+    const candidatas = semanas
+      .filter((semana) => Number(semana.projeto_id) === id)
+      .sort((a, b) => Number(b.semana || 0) - Number(a.semana || 0));
+
+    const escolhida = candidatas.find((semana) => semana.status === "aberta") || candidatas[0];
+    if (escolhida) semanaAtualPorProjeto.set(id, escolhida);
+  }
+
+  const semanaIds = Array.from(semanaAtualPorProjeto.values())
+    .map((semana) => Number(semana.id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+
+  let participantesRaw: any[] = [];
+  if (semanaIds.length) {
+    const { data, error } = await supabase
+      .from("projeto_semana_elenco")
+      .select("*")
+      .in("projeto_semana_id", semanaIds)
+      .order("id", { ascending: true });
+
+    if (error) {
+      console.error("Erro ao carregar participantes para atividade semanal:", error);
+    } else {
+      participantesRaw = data || [];
+    }
+  }
+
+  const agora = Date.now();
+
+  return projetosValidos.map((projeto) => {
+    const projetoId = Number(projeto.ID);
+    const semana = semanaAtualPorProjeto.get(projetoId) || null;
+
+    if (!semana?.id) {
+      return {
+        projetoId: projeto.ID,
+        projeto: projeto.Projeto || `Projeto #${projeto.ID}`,
+        lider: projeto.Lider || "",
+        editor: projeto.Editor || "",
+        statusProjeto: projeto.Status || "",
+        semana: null,
+        semanaStatus: null,
+        abertaEm: null,
+        prazoEm: null,
+        ultimaAtividade: null,
+        previstos: 0,
+        entregaram: 0,
+        naoEntregaram: 0,
+        pendentes: 0,
+        aprovados: 0,
+        regravacoes: 0,
+        progressoRecebimento: 0,
+        progressoAprovacao: 0,
+        situacao: "sem_dados" as const,
+        participantes: [],
+      };
+    }
+
+    const participantes = participantesRaw
+      .filter((item) => Number(item.projeto_semana_id) === Number(semana.id))
+      .map((item) => ({
+        personagem: String(item.personagem_snapshot || ""),
+        dublador: String(item.dublador_snapshot || ""),
+        telefone: String(item.telefone_snapshot || ""),
+        criadoEm: String(item.criado_em || ""),
+      }));
+
+    const entregasSemana = entregas
+      .filter(
+        (entrega) =>
+          Number(entrega.projeto_id) === projetoId &&
+          numeroSemanaEntrega(entrega.semana) === Number(semana.semana)
+      )
+      .sort((a, b) => {
+        const dataA = Math.max(
+          timestampRelatorio(a.data_avaliacao),
+          timestampRelatorio(a.data_envio),
+          timestampRelatorio(a.atualizado_em),
+          timestampRelatorio(a.criado_em)
+        );
+        const dataB = Math.max(
+          timestampRelatorio(b.data_avaliacao),
+          timestampRelatorio(b.data_envio),
+          timestampRelatorio(b.atualizado_em),
+          timestampRelatorio(b.criado_em)
+        );
+        return dataB - dataA;
+      });
+
+    const detalhes: ParticipanteAtividadeSemanal[] = participantes.map((participante) => {
+      const telefone = telefoneRelatorio(participante.telefone);
+      const personagem = normalizar(participante.personagem);
+      const dublador = normalizar(participante.dublador);
+
+      const entrega = entregasSemana.find((item) => {
+        const telefoneEntrega = telefoneRelatorio(item.telefone);
+        const personagemEntrega = normalizar(item.personagem);
+        const dubladorEntrega = normalizar(item.dublador);
+        if (personagem && personagemEntrega !== personagem) return false;
+        if (telefone && telefoneEntrega && telefone === telefoneEntrega) return true;
+        return Boolean(dublador && dubladorEntrega === dublador);
+      });
+
+      const status: ParticipanteAtividadeSemanal["status"] = !entrega
+        ? "nao_entregou"
+        : entrega.status === "aprovado"
+        ? "aprovado"
+        : entrega.status === "regravacao"
+        ? "regravacao"
+        : "aguardando_analise";
+
+      return {
+        personagem: participante.personagem,
+        dublador: participante.dublador,
+        telefone: participante.telefone,
+        status,
+        data_envio: entrega?.data_envio || null,
+        data_avaliacao: entrega?.data_avaliacao || null,
+        comentario: entrega?.comentario || null,
+      };
+    });
+
+    const previstos = detalhes.length;
+    const naoEntregaram = detalhes.filter((item) => item.status === "nao_entregou").length;
+    const entregaram = previstos - naoEntregaram;
+    const pendentes = detalhes.filter((item) => item.status === "aguardando_analise").length;
+    const aprovados = detalhes.filter((item) => item.status === "aprovado").length;
+    const regravacoes = detalhes.filter((item) => item.status === "regravacao").length;
+    const progressoRecebimento = previstos ? Math.round((entregaram / previstos) * 100) : 0;
+    const progressoAprovacao = previstos ? Math.round((aprovados / previstos) * 100) : 0;
+
+    const ultimaAtividade = dataMaisRecenteRelatorio([
+      semana.aberta_em,
+      semana.fechada_em,
+      ...participantes.map((item) => item.criadoEm),
+      ...entregasSemana.flatMap((item) => [
+        item.data_envio,
+        item.data_avaliacao,
+        item.atualizado_em,
+        item.criado_em,
+      ]),
+    ]);
+
+    const prazoTs = timestampRelatorio(semana.prazo_em);
+    const prazoVencido =
+      semana.status === "aberta" && prazoTs > 0 && prazoTs < agora;
+
+    let situacao: SituacaoAtividadeSemanal = "normal";
+    if (semana.status === "concluida") {
+      situacao = "concluida";
+    } else if (!previstos) {
+      situacao = "sem_dados";
+    } else if (prazoVencido && (naoEntregaram > 0 || aprovados < previstos)) {
+      situacao = "critico";
+    } else if (regravacoes > 0) {
+      situacao = "regravacao";
+    } else if (pendentes > 0) {
+      situacao = "aguardando_analise";
+    } else if (naoEntregaram > 0) {
+      situacao = "atencao";
+    }
+
+    return {
+      projetoId: projeto.ID,
+      projeto: projeto.Projeto || `Projeto #${projeto.ID}`,
+      lider: projeto.Lider || "",
+      editor: projeto.Editor || "",
+      statusProjeto: projeto.Status || "",
+      semana: Number(semana.semana) || 1,
+      semanaStatus: semana.status || null,
+      abertaEm: semana.aberta_em || null,
+      prazoEm: semana.prazo_em || null,
+      ultimaAtividade,
+      previstos,
+      entregaram,
+      naoEntregaram,
+      pendentes,
+      aprovados,
+      regravacoes,
+      progressoRecebimento,
+      progressoAprovacao,
+      situacao,
+      participantes: detalhes,
+    };
+  });
+}
+
 export async function criarProximaSemanaProjetoBanco(
   projetoId: string,
   usuario = "Sistema"
@@ -2429,6 +2883,76 @@ export async function fecharSemanaProjetoBanco(
 
   if (error) {
     console.error("Erro ao concluir semana:", error);
+    return false;
+  }
+
+  return true;
+}
+
+export async function reabrirSemanaProjetoBanco(
+  projetoId: string,
+  semana: number,
+  usuario = "Sistema"
+): Promise<boolean> {
+  const { error } = await supabase
+    .from("projeto_semanas")
+    .update({
+      status: "aberta",
+      fechada_em: null,
+      liberada_por: usuario,
+    })
+    .eq("projeto_id", Number(projetoId))
+    .eq("semana", semana);
+
+  if (error) {
+    console.error("Erro ao reabrir semana:", error);
+    return false;
+  }
+
+  return true;
+}
+
+export async function excluirSemanaProjetoBanco(
+  projetoId: string,
+  semana: number
+): Promise<boolean> {
+  const projetoNumero = Number(projetoId);
+
+  if (!Number.isFinite(projetoNumero) || !Number.isFinite(semana)) {
+    return false;
+  }
+
+  const { data: semanaDb, error: erroSemana } = await supabase
+    .from("projeto_semanas")
+    .select("id")
+    .eq("projeto_id", projetoNumero)
+    .eq("semana", semana)
+    .maybeSingle();
+
+  if (erroSemana) {
+    console.error("Erro ao localizar semana para exclusão:", erroSemana);
+    return false;
+  }
+
+  if (!semanaDb?.id) return true;
+
+  const { error: erroParticipantes } = await supabase
+    .from("projeto_semana_elenco")
+    .delete()
+    .eq("projeto_semana_id", Number(semanaDb.id));
+
+  if (erroParticipantes) {
+    console.error("Erro ao excluir participantes da semana:", erroParticipantes);
+    return false;
+  }
+
+  const { error } = await supabase
+    .from("projeto_semanas")
+    .delete()
+    .eq("id", Number(semanaDb.id));
+
+  if (error) {
+    console.error("Erro ao excluir semana do projeto:", error);
     return false;
   }
 
@@ -2707,6 +3231,116 @@ export async function carregarRespostasTreinamentoBanco(): Promise<
   }));
 }
 
+export type ResultadoCriacaoUsuario = {
+  ok: boolean;
+  error?: string;
+  precisaConfirmarEmail?: boolean;
+  modo?: "edge" | "signup";
+};
+
+export async function criarUsuarioCompletoBanco(
+  usuario: Usuario,
+  senha: string,
+  criadoPor: string
+): Promise<ResultadoCriacaoUsuario> {
+  try {
+    assertWritable("A criação de usuário no Supabase Auth");
+  } catch (error: any) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+
+  const email = normalizar(usuario.login);
+  const password = String(senha || "");
+
+  if (!email || !email.includes("@")) {
+    return { ok: false, error: "Informe um e-mail válido para o usuário." };
+  }
+  if (password.length < 8) {
+    return { ok: false, error: "A senha precisa ter pelo menos 8 caracteres." };
+  }
+
+  const perfil = {
+    nome: String(usuario.nome || "").trim(),
+    login: email,
+    cargo: usuario.cargo,
+    vinculo: String(usuario.vinculo || "").trim(),
+    training_status: usuario.training_status || "nao_aplicavel",
+    criado_por: criadoPor || null,
+    ...permissoesDisponiveis.reduce((acc, item) => {
+      acc[item.chave] = Boolean(usuario[item.chave]);
+      return acc;
+    }, {} as Record<ChavePermissao, boolean>),
+  };
+
+  // Caminho principal: Edge Function com service role. Ela cria o usuário no
+  // Authentication e o perfil em `usuarios` numa única operação.
+  try {
+    const { data, error } = await supabase.functions.invoke("admin-create-user", {
+      body: { email, password, perfil },
+    });
+
+    if (!error && data?.ok) {
+      return { ok: true, precisaConfirmarEmail: false, modo: "edge" };
+    }
+
+    if (error || data?.error) {
+      console.warn(
+        "Edge Function admin-create-user indisponível; tentando cadastro isolado:",
+        data?.error || error
+      );
+    }
+  } catch (error) {
+    console.warn(
+      "Não foi possível usar admin-create-user; tentando cadastro isolado:",
+      error
+    );
+  }
+
+  // Fallback seguro para ambientes onde a Edge Function ainda não foi
+  // implantada. Usa um cliente separado para não substituir a sessão de quem
+  // está administrando o Manager.
+  try {
+    const clienteCadastro = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      global: { fetch: guardedFetch },
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
+
+    const { data: authData, error: authError } = await clienteCadastro.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { nome: perfil.nome },
+      },
+    });
+
+    if (authError) {
+      return { ok: false, error: authError.message };
+    }
+
+    const { error: profileError } = await supabase.from("usuarios").insert([perfil]);
+    if (profileError) {
+      return {
+        ok: false,
+        error:
+          `O acesso foi criado, mas o perfil não pôde ser salvo: ${profileError.message}. ` +
+          "Corrija o perfil na tabela usuarios antes de tentar novamente.",
+      };
+    }
+
+    return {
+      ok: true,
+      precisaConfirmarEmail: !authData.session,
+      modo: "signup",
+    };
+  } catch (error: any) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+}
+
 export async function carregarUsuariosBanco(): Promise<Usuario[]> {
   const { data, error } = await supabase
     .from("usuarios")
@@ -2721,57 +3355,210 @@ export async function carregarUsuariosBanco(): Promise<Usuario[]> {
   return (data || []).map(mapUsuarioDb);
 }
 
-export async function carregarMembrosBanco(): Promise<Membro[]> {
-  const { data, error } = await supabase
-    .from("membros")
-    .select("*")
-    .order("data_entrada", { ascending: false });
+type RespostaMembrosPlanilha<T = any> = {
+  ok: boolean;
+  data?: T;
+  error?: string;
+};
 
-  if (error) {
-    console.error("Erro ao buscar membros:", error);
-    return [];
+function configuracaoMembrosPlanilha() {
+  const url = String(import.meta.env.VITE_MEMBROS_SHEETS_WEBAPP_URL || "").trim();
+  const token = String(import.meta.env.VITE_MEMBROS_SHEETS_TOKEN || "").trim();
+
+  if (!url) {
+    throw new Error(
+      "A integração de membros com o Google Planilhas não está configurada. Defina VITE_MEMBROS_SHEETS_WEBAPP_URL no arquivo .env.local."
+    );
   }
 
-  return (data || []).map(mapMembroDb);
+  return { url, token };
+}
+
+async function chamarMembrosPlanilha<T>(
+  acao: string,
+  payload: Record<string, any> = {}
+): Promise<T> {
+  const acoesSomenteLeitura = new Set(["ping", "listar_membros", "historico_membro"]);
+  if (!acoesSomenteLeitura.has(acao)) {
+    assertWritable(`A ação de membros ${acao}`);
+  }
+
+  const { url, token } = configuracaoMembrosPlanilha();
+  const resposta = await guardedFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ acao, token, ...payload }),
+    redirect: "follow",
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`Google Planilhas respondeu HTTP ${resposta.status}.`);
+  }
+
+  const json = (await resposta.json()) as RespostaMembrosPlanilha<T>;
+  if (!json?.ok) {
+    throw new Error(json?.error || "Falha ao acessar a planilha de membros.");
+  }
+
+  return json.data as T;
+}
+
+export async function testarConexaoMembrosPlanilha(): Promise<{
+  planilha: string;
+  aba: string;
+  total: number;
+}> {
+  return chamarMembrosPlanilha("ping");
+}
+
+let cacheMembrosPlanilha: { data: Membro[]; carregadoEm: number } | null = null;
+let requisicaoMembrosEmAndamento: Promise<Membro[]> | null = null;
+const CACHE_MEMBROS_MS = 45_000;
+
+export async function carregarMembrosBanco(forcarAtualizacao = false): Promise<Membro[]> {
+  const agora = Date.now();
+
+  if (
+    !forcarAtualizacao &&
+    cacheMembrosPlanilha &&
+    agora - cacheMembrosPlanilha.carregadoEm < CACHE_MEMBROS_MS
+  ) {
+    return cacheMembrosPlanilha.data;
+  }
+
+  // Evita que restauração de sessão + listener de autenticação façam duas
+  // leituras completas da planilha ao mesmo tempo.
+  if (!forcarAtualizacao && requisicaoMembrosEmAndamento) {
+    return requisicaoMembrosEmAndamento;
+  }
+
+  const requisicao = (async () => {
+    try {
+      const data = await chamarMembrosPlanilha<any[]>("listar_membros");
+      const membros = (data || []).map(mapMembroDb);
+      cacheMembrosPlanilha = { data: membros, carregadoEm: Date.now() };
+      return membros;
+    } catch (error) {
+      console.error("Erro ao buscar membros na planilha:", error);
+      throw error;
+    } finally {
+      requisicaoMembrosEmAndamento = null;
+    }
+  })();
+
+  requisicaoMembrosEmAndamento = requisicao;
+  return requisicao;
+}
+
+export function invalidarCacheMembrosPlanilha() {
+  cacheMembrosPlanilha = null;
+}
+
+type AtorMembroPlanilha = {
+  nome?: string;
+  cargo?: string;
+};
+
+
+type AlteracoesMembroPlanilha = Partial<{
+  nome: string | null;
+  telefone: string | null;
+  data_entrada: string | null;
+  data_saida: string | null;
+  observacao: string | null;
+  movimentacao: string | null;
+  participacao: StatusMembro;
+  atendimento: AtendimentoMembro;
+}>;
+
+export async function atualizarMembroCamposPlanilha(
+  membroId: number,
+  alteracoes: AlteracoesMembroPlanilha,
+  ator?: AtorMembroPlanilha
+): Promise<boolean> {
+  try {
+    if (!Object.keys(alteracoes || {}).length) return true;
+    await chamarMembrosPlanilha("atualizar_membro", {
+      membroId,
+      alteracoes,
+      ator: ator || null,
+    });
+    invalidarCacheMembrosPlanilha();
+    return true;
+  } catch (error) {
+    console.error("Erro ao atualizar membro na planilha:", error);
+    return false;
+  }
+}
+
+export async function atualizarMembroCampoPlanilha(
+  membroId: number,
+  campo:
+    | "nome"
+    | "telefone"
+    | "data_entrada"
+    | "data_saida"
+    | "observacao"
+    | "movimentacao",
+  valor: string | null,
+  ator?: AtorMembroPlanilha
+): Promise<boolean> {
+  return atualizarMembroCamposPlanilha(
+    membroId,
+    { [campo]: valor ?? null } as AlteracoesMembroPlanilha,
+    ator
+  );
 }
 
 export async function atualizarStatusMembroBanco(
   membroId: number,
   status: StatusMembro,
-  observacaoAtual?: string | null
+  ator?: AtorMembroPlanilha
 ): Promise<boolean> {
   const hoje = new Date().toISOString().slice(0, 10);
-  const observacaoAutomatica =
-    status === "na_comunidade"
-      ? `Retornou/permanece na comunidade em ${formatarDataBR(hoje)}.`
-      : `${statusMembroLabel(status)} em ${formatarDataBR(hoje)}.`;
-
-  const observacaoFinal = [observacaoAtual || "", observacaoAutomatica]
-    .filter(Boolean)
-    .join("\n");
-
-  const payload: any = {
-    status_comunidade: status,
-    observacao: observacaoFinal,
+  const alteracoes: Record<string, string | null> = {
+    participacao: status,
   };
 
   if (status === "na_comunidade") {
-    payload.data_saida = null;
-  } else {
-    payload.data_saida = hoje;
+    alteracoes.data_entrada = hoje;
+    alteracoes.data_saida = null;
+  } else if (status === "saiu" || status === "banido") {
+    alteracoes.data_saida = hoje;
   }
 
-  const { error } = await supabase
-    .from("membros")
-    .update(payload)
-    .eq("id", membroId);
-
-  if (error) {
-    console.error("Erro ao atualizar membro:", error);
-    return false;
+  const ok = await atualizarMembroCamposPlanilha(
+    membroId,
+    alteracoes as AlteracoesMembroPlanilha,
+    ator
+  );
+  if (!ok) {
+    console.error("Erro ao atualizar participação do membro na planilha.");
   }
+  return ok;
+}
 
-  return true;
+export async function atualizarAtendimentoMembroBanco(
+  membroId: number,
+  atendimento: AtendimentoMembro,
+  ator?: AtorMembroPlanilha
+): Promise<boolean> {
+  return atualizarMembroCamposPlanilha(membroId, { atendimento }, ator);
+}
+
+export async function carregarHistoricoMembroPlanilha(
+  membroId: number
+): Promise<HistoricoMembroEvento[]> {
+  try {
+    const data = await chamarMembrosPlanilha<HistoricoMembroEvento[]>(
+      "historico_membro",
+      { membroId }
+    );
+    return Array.isArray(data) ? data : [];
+  } catch (error) {
+    console.error("Erro ao carregar histórico do membro:", error);
+    return [];
+  }
 }
 
 export async function buscarPerfilPorEmail(email: string): Promise<Usuario | null> {
@@ -2847,6 +3634,42 @@ export async function carregarProjetosBanco(
   return (projetosDb || []).map((item: any) =>
     mapProjetoDb(item, elencoPorProjeto.get(String(item.id)) || [])
   );
+}
+
+export async function enviarCapaProjetoArquivo(arquivo: File): Promise<string | null> {
+  if (!arquivo) return null;
+
+  if (!String(arquivo.type || "").startsWith("image/")) {
+    throw new Error("Selecione um arquivo de imagem para a capa.");
+  }
+
+  const limite = 8 * 1024 * 1024;
+  if (arquivo.size > limite) {
+    throw new Error("A capa deve ter no máximo 8 MB.");
+  }
+
+  const extensaoOriginal = arquivo.name.split(".").pop() || "jpg";
+  const extensao = extensaoOriginal.replace(/[^a-zA-Z0-9]/g, "").toLowerCase() || "jpg";
+  const nome = `capa-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${extensao}`;
+  const storagePath = `projetos/${nome}`;
+
+  const { error } = await supabase.storage
+    .from("project-covers")
+    .upload(storagePath, arquivo, {
+      cacheControl: "3600",
+      upsert: false,
+      contentType: arquivo.type || "image/jpeg",
+    });
+
+  if (error) {
+    console.error("Erro ao enviar capa do projeto:", error);
+    throw new Error(
+      "Não consegui enviar a capa. Verifique se o bucket project-covers foi configurado no Supabase."
+    );
+  }
+
+  const { data } = supabase.storage.from("project-covers").getPublicUrl(storagePath);
+  return data?.publicUrl || null;
 }
 
 export async function criarProjetoBanco(projeto: Projeto): Promise<string | null> {
